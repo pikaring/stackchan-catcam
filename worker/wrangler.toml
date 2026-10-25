@@ -2,6 +2,10 @@ name = "stackchan-catcam"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
+# workers.dev で公開し、プレビューURLは使わない
+workers_dev = true
+preview_urls = false
+
 [[r2_buckets]]
 binding = "PHOTOS"
 bucket_name = "stackchan-catcam"
@@ -16,7 +20,7 @@ crons = ["0 11 * * *"]
 
 [vars]
 # デプロイ後の Worker の URL (LINE が画像を取りに来る)
-PUBLIC_BASE_URL = "https://stackchan-catcam.<your-subdomain>.workers.dev"
+PUBLIC_BASE_URL = "https://stackchan-catcam.pikaring-0e1.workers.dev"
 # 空なら友だち全員へ broadcast。特定の人だけに送るなら LINE の userId
 LINE_TO = ""
 
