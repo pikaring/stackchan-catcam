@@ -1,0 +1,24 @@
+name = "stackchan-catcam"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "stackchan-catcam"
+
+# 猫判定 (Workers AI の物体検出)
+[ai]
+binding = "AI"
+
+# 毎日 20:00 JST (= 11:00 UTC) にその日の写真をLINEへ送る
+[triggers]
+crons = ["0 11 * * *"]
+
+[vars]
+# デプロイ後の Worker の URL (LINE が画像を取りに来る)
+PUBLIC_BASE_URL = "https://stackchan-catcam.<your-subdomain>.workers.dev"
+# 空なら友だち全員へ broadcast。特定の人だけに送るなら LINE の userId
+LINE_TO = ""
+
+# secrets (wrangler secret put):
+#   UPLOAD_TOKEN, SIGNING_SECRET, LINE_CHANNEL_ACCESS_TOKEN

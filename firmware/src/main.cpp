@@ -1,0 +1,184 @@
+// Stack-chan (M5Stack CoreS3) 猫見守りカメラ
+// 1時間に1回、または動体検知で撮影して Worker にアップロードする。
+#include <M5CoreS3.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "img_converters.h"
+#include "secrets.h"
+
+// ---- 調整用パラメータ ----
+static const uint32_t HOURLY_INTERVAL_MS = 60UL * 60UL * 1000UL;
+static const uint32_t MOTION_COOLDOWN_MS = 60UL * 1000UL;  // 動体検知の連続撮影を抑える
+static const uint16_t MAX_MOTION_SHOTS_PER_DAY = 150;      // 猫が動き続けても上限で止める
+static const uint8_t JPEG_QUALITY = 12;                    // 小さいほど高画質 (10-63)
+static const uint8_t CELL_DIFF_THRESHOLD = 24;             // 1セルの輝度差がこれ以上で「変化」
+static const float MOTION_RATIO = 0.04f;                   // 変化セルがこの割合以上で動体とみなす
+static const uint8_t MOTION_CONFIRM_FRAMES = 2;            // 連続して検知したら確定 (ノイズ対策)
+static const uint32_t DISPLAY_SLEEP_MS = 15UL * 1000UL;    // 起動後、画面を消すまでの時間
+
+// 動体検知はフレームを GRID_W x GRID_H のセルに間引いて比較する
+static const int GRID_W = 80;
+static const int GRID_H = 60;
+
+static uint8_t background[GRID_W * GRID_H];
+static bool backgroundReady = false;
+static uint8_t motionStreak = 0;
+
+static uint32_t lastHourlyMs = 0;
+static uint32_t lastMotionShotMs = 0;
+static uint16_t motionShotsToday = 0;
+static uint32_t dayStartMs = 0;
+
+static void showStatus(const char* msg) {
+  CoreS3.Display.fillRect(0, 0, 320, 24, TFT_BLACK);
+  CoreS3.Display.setCursor(4, 4);
+  CoreS3.Display.print(msg);
+  Serial.println(msg);
+}
+
+static bool ensureWifi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) delay(250);
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// RGB565 のバイト順に依存しないよう、2バイトの平均を輝度の代用にする
+static inline uint8_t lumaAt(const camera_fb_t* fb, int x, int y) {
+  const uint8_t* p = fb->buf + ((size_t)y * fb->width + x) * 2;
+  return (uint8_t)(((uint16_t)p[0] + p[1]) >> 1);
+}
+
+// 背景(移動平均)との差分で動体を判定する。ゆっくり動く猫も拾える。
+static bool detectMotion(const camera_fb_t* fb) {
+  const int stepX = fb->width / GRID_W;
+  const int stepY = fb->height / GRID_H;
+  int changed = 0;
+  for (int gy = 0; gy < GRID_H; gy++) {
+    for (int gx = 0; gx < GRID_W; gx++) {
+      uint8_t cur = lumaAt(fb, gx * stepX, gy * stepY);
+      uint8_t& bg = background[gy * GRID_W + gx];
+      if (!backgroundReady) {
+        bg = cur;
+        continue;
+      }
+      int diff = (int)cur - (int)bg;
+      if (diff < 0) diff = -diff;
+      if (diff >= CELL_DIFF_THRESHOLD) changed++;
+      bg = (uint8_t)((int)bg + (((int)cur - (int)bg) >> 2));
+    }
+  }
+  if (!backgroundReady) {
+    backgroundReady = true;
+    return false;
+  }
+  bool over = changed >= (int)(GRID_W * GRID_H * MOTION_RATIO);
+  motionStreak = over ? motionStreak + 1 : 0;
+  return motionStreak >= MOTION_CONFIRM_FRAMES;
+}
+
+static bool upload(const camera_fb_t* fb, const char* kind) {
+  uint8_t* jpg = nullptr;
+  size_t jpgLen = 0;
+  if (!frame2jpg(const_cast<camera_fb_t*>(fb), 100 - JPEG_QUALITY, &jpg, &jpgLen)) {
+    showStatus("jpeg encode failed");
+    return false;
+  }
+  bool ok = false;
+  if (ensureWifi()) {
+    WiFiClientSecure client;
+    client.setInsecure();  // 証明書検証なし。気になる場合は setCACert で固定する
+    HTTPClient http;
+    String url = String(UPLOAD_URL) + "?kind=" + kind;
+    if (http.begin(client, url)) {
+      http.setTimeout(20000);  // Worker 側の猫判定ぶん待つ
+      http.addHeader("Authorization", String("Bearer ") + UPLOAD_TOKEN);
+      http.addHeader("Content-Type", "image/jpeg");
+      int code = http.POST(jpg, jpgLen);
+      ok = code >= 200 && code < 300;
+      char msg[48];
+      snprintf(msg, sizeof(msg), "%s upload: %d (%uB)", kind, code, (unsigned)jpgLen);
+      showStatus(msg);
+      http.end();
+    }
+  } else {
+    showStatus("wifi unavailable");
+  }
+  free(jpg);
+  return ok;
+}
+
+// 撮影してアップロード。AE が落ち着くよう数フレーム捨ててから撮る。
+static void captureAndUpload(const char* kind) {
+  for (int i = 0; i < 3; i++) {
+    if (CoreS3.Camera.get()) CoreS3.Camera.free();
+  }
+  if (!CoreS3.Camera.get()) {
+    showStatus("capture failed");
+    return;
+  }
+  upload(CoreS3.Camera.fb, kind);
+  CoreS3.Camera.free();
+}
+
+void setup() {
+  auto cfg = M5.config();
+  CoreS3.begin(cfg);
+  Serial.begin(115200);
+  CoreS3.Display.setTextSize(1);
+  CoreS3.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  if (!CoreS3.Camera.begin()) {
+    showStatus("camera init failed");
+    while (true) delay(1000);
+  }
+  CoreS3.Camera.sensor->set_framesize(CoreS3.Camera.sensor, FRAMESIZE_VGA);
+
+  showStatus("connecting wifi...");
+  WiFi.mode(WIFI_STA);
+  showStatus(ensureWifi() ? "wifi connected" : "wifi failed (will retry)");
+
+  lastHourlyMs = millis();
+  dayStartMs = millis();
+  captureAndUpload("hourly");  // 起動確認を兼ねて1枚
+}
+
+void loop() {
+  CoreS3.update();
+  uint32_t now = millis();
+
+  // 起動後しばらくしたら画面を消す (猫が気にしないように・省電力)
+  if (now > DISPLAY_SLEEP_MS) CoreS3.Display.setBrightness(0);
+  // 画面タッチで一時的に点灯
+  if (CoreS3.Touch.getCount() > 0) CoreS3.Display.setBrightness(80);
+
+  if (now - dayStartMs >= 24UL * 60UL * 60UL * 1000UL) {
+    dayStartMs = now;
+    motionShotsToday = 0;
+  }
+
+  if (now - lastHourlyMs >= HOURLY_INTERVAL_MS) {
+    lastHourlyMs = now;
+    captureAndUpload("hourly");
+    return;
+  }
+
+  if (!CoreS3.Camera.get()) {
+    delay(20);
+    return;
+  }
+  bool motion = detectMotion(CoreS3.Camera.fb);
+  CoreS3.Camera.free();
+
+  if (motion && now - lastMotionShotMs >= MOTION_COOLDOWN_MS &&
+      motionShotsToday < MAX_MOTION_SHOTS_PER_DAY) {
+    lastMotionShotMs = now;
+    motionShotsToday++;
+    motionStreak = 0;
+    captureAndUpload("motion");
+    backgroundReady = false;  // 撮影中の時間経過ぶん背景を取り直す
+  }
+  delay(50);
+}
