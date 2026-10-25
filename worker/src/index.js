@@ -49,22 +49,39 @@ function authorized(request, env) {
   return env.UPLOAD_TOKEN && timingSafeEqual(header, `Bearer ${env.UPLOAD_TOKEN}`);
 }
 
-// 画像内の "cat" の最大スコアを返す。判定に失敗したら -1（不明）
-async function catScore(env, body) {
+// 画像内で最もスコアの高い "cat" のスコアと、その枠の中心の横位置（0=左端, 1=右端）を返す。
+// 猫がいなければ cx は null。判定に失敗したら cat は -1（不明）
+export function bestCat(detections, width) {
+  let best = null;
+  for (const d of detections) {
+    if (d.label === "cat" && (!best || d.score > best.score)) best = d;
+  }
+  if (!best) return { cat: 0, cx: null };
+  const { xmin, xmax } = best.box || {};
+  let cx = null;
+  if (Number.isFinite(xmin) && Number.isFinite(xmax)) {
+    // 座標が 0-1 の正規化値ならそのまま、ピクセルなら画像幅で割る
+    const center = (xmin + xmax) / 2;
+    cx = xmax <= 1 ? center : width > 0 ? center / width : null;
+  }
+  return { cat: best.score, cx };
+}
+
+async function detectCat(env, body, width) {
   try {
     const detections = await env.AI.run(DETECTION_MODEL, { image: [...new Uint8Array(body)] });
-    return detections
-      .filter((d) => d.label === "cat")
-      .reduce((max, d) => Math.max(max, d.score), 0);
+    return bestCat(detections, width);
   } catch (err) {
     console.error("cat detection failed", err);
-    return -1;
+    return { cat: -1, cx: null };
   }
 }
 
 async function handleUpload(request, env) {
   if (!authorized(request, env)) return new Response("unauthorized", { status: 401 });
-  const kind = new URL(request.url).searchParams.get("kind") === "motion" ? "motion" : "hourly";
+  const params = new URL(request.url).searchParams;
+  const kind = ["motion", "center"].includes(params.get("kind")) ? params.get("kind") : "hourly";
+  const width = Number(params.get("w")) || 0;
   const body = await request.arrayBuffer();
   if (body.byteLength === 0 || body.byteLength > MAX_UPLOAD_BYTES) {
     return new Response("bad size", { status: 413 });
@@ -72,14 +89,14 @@ async function handleUpload(request, env) {
   const head = new Uint8Array(body, 0, 2);
   if (head[0] !== 0xff || head[1] !== 0xd8) return new Response("not a jpeg", { status: 400 });
 
-  const cat = await catScore(env, body);
+  const { cat, cx } = await detectCat(env, body, width);
   const { date, time } = jstNow();
   const key = `photos/${date}/${time}-${kind}.jpg`;
   await env.PHOTOS.put(key, body, {
     httpMetadata: { contentType: "image/jpeg" },
     customMetadata: { kind, cat: cat.toFixed(3) },
   });
-  return Response.json({ key, cat });
+  return Response.json({ key, cat, cx });
 }
 
 async function handleImage(request, env, key) {

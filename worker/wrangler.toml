@@ -14,9 +14,10 @@ bucket_name = "stackchan-catcam"
 [ai]
 binding = "AI"
 
-# 毎日 20:00 JST (= 11:00 UTC) にその日の写真をLINEへ送る
+# 毎日 18:05 JST (= 9:05 UTC) にその日の写真をLINEへ送る
+# StackChan の夜間停止を 18:00 開始にしたとき、最後のアップロードが届くよう5分待つ
 [triggers]
-crons = ["0 11 * * *"]
+crons = ["5 9 * * *"]
 
 [vars]
 # デプロイ後の Worker の URL (LINE が画像を取りに来る)
