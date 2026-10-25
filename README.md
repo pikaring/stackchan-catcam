@@ -82,4 +82,4 @@ pio device monitor
 ## 既知の注意
 
 - TLS は `setInsecure()`（証明書検証なし）。気になる場合は Cloudflare のルート証明書を `setCACert` で固定する。
-- ファームウェアは**ビルドも実機確認もしていない**。PlatformIO の `lib_deps`（StackChan-BSP の git 指定、IRremoteESP8266、M5Unit-NFC のレジストリ名）は推測を含むので、通らなければ Arduino IDE の Library Manager で M5StackChan を入れる方法に切り替える。\n- 実機での動作確認、Workers AI による猫判定の精度確認は未実施。夜や暗い部屋だと判定が落ちる可能性がある。
+- ファームウェアは PlatformIO でのビルドは成功したが、**実機確認はまだ**。
