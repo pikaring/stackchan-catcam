@@ -4,6 +4,15 @@ const URL_LIFETIME_SEC = 30 * 24 * 3600;
 const DIGEST_PHOTO_COUNT = 4;
 const DETECTION_MODEL = "@cf/facebook/detr-resnet-50";
 const CAT_SCORE_THRESHOLD = 0.6;
+// 首の向きを決めるための2つ目の判定 (画像を読める LLM)。DETR は暗い所で丸まった黒猫を見落とすため。
+// 見間違いもあるので LINE の写真選びには使わず、首を向ける (aim) だけに使う
+const VISION_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
+const VISION_KINDS = ["hourly", "search", "center"];  // 動体検知の写真には使わない (回数を抑える)
+const AIM_HINT_SCORE = 0.3;   // ファームの CAT_HINT_SCORE と揃える。DETR がこれ未満のときだけ LLM に聞く
+const VISION_AIM_SCORE = 0.5; // LLM が猫ありと答えたときに返す aim
+const VISION_TIMEOUT_MS = 10000;
+const VISION_PROMPT =
+  'Is there a cat in this image? If yes, give the horizontal position of its center as a number from 0 (left edge) to 1 (right edge). Reply only JSON like {"cat":true,"x":0.4}.';
 
 const encoder = new TextEncoder();
 
@@ -77,10 +86,61 @@ async function detectCat(env, body, width) {
   }
 }
 
+// 起動後最初のアップロードに付く再起動の情報 (リセット理由など) をメタデータ用に取り出す
+const BOOT_INFO_KEYS = ["reset", "boots", "heap", "wifi"];
+export function bootInfo(params) {
+  const info = {};
+  for (const k of BOOT_INFO_KEYS) {
+    const v = params.get(k);
+    if (v && /^[A-Za-z0-9_]{1,16}$/.test(v)) info[k] = v;
+  }
+  return info;
+}
+
+// LLM の返答から {cat, x} を取り出す。猫なし・読めなければ null
+export function parseVision(text) {
+  const m = typeof text === "string" ? text.match(/\{[^}]*\}/) : null;
+  if (!m) return null;
+  try {
+    const j = JSON.parse(m[0]);
+    if (j.cat !== true) return null;
+    const x = Number(j.x);
+    return { x: Number.isFinite(x) && x >= 0 && x <= 1 ? x : null };
+  } catch {
+    return null;
+  }
+}
+
+async function askVision(env, body) {
+  const b64 = btoa(Array.from(new Uint8Array(body), (c) => String.fromCharCode(c)).join(""));
+  const run = env.AI.run(VISION_MODEL, {
+    max_tokens: 60,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: VISION_PROMPT },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${b64}` } },
+        ],
+      },
+    ],
+  });
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), VISION_TIMEOUT_MS));
+  try {
+    const out = await Promise.race([run, timeout]);
+    const text = out?.choices?.[0]?.message?.content ?? (typeof out?.response === "string" ? out.response : JSON.stringify(out?.response ?? ""));
+    return { answered: true, cat: parseVision(text) };
+  } catch (err) {
+    console.error("vision check failed", err);
+    return { answered: false, cat: null };
+  }
+}
+
 async function handleUpload(request, env) {
   if (!authorized(request, env)) return new Response("unauthorized", { status: 401 });
   const params = new URL(request.url).searchParams;
-  const kind = ["motion", "center"].includes(params.get("kind")) ? params.get("kind") : "hourly";
+  const kind = ["motion", "center", "search"].includes(params.get("kind")) ? params.get("kind") : "hourly";
   const width = Number(params.get("w")) || 0;
   const body = await request.arrayBuffer();
   if (body.byteLength === 0 || body.byteLength > MAX_UPLOAD_BYTES) {
@@ -90,13 +150,25 @@ async function handleUpload(request, env) {
   if (head[0] !== 0xff || head[1] !== 0xd8) return new Response("not a jpeg", { status: 400 });
 
   const { cat, cx } = await detectCat(env, body, width);
+  // aim/aimCx は首の向きを決めるためだけの値。cat (DETR) は LINE の写真選びに使う
+  let aim = cat;
+  let aimCx = cx;
+  const extra = {};
+  if (cat >= 0 && cat < AIM_HINT_SCORE && VISION_KINDS.includes(kind)) {
+    const vision = await askVision(env, body);
+    if (vision.answered) extra.vision = vision.cat ? "cat" : "none";
+    if (vision.cat) {
+      aim = VISION_AIM_SCORE;
+      aimCx = vision.cat.x;
+    }
+  }
   const { date, time } = jstNow();
   const key = `photos/${date}/${time}-${kind}.jpg`;
   await env.PHOTOS.put(key, body, {
     httpMetadata: { contentType: "image/jpeg" },
-    customMetadata: { kind, cat: cat.toFixed(3) },
+    customMetadata: { kind, cat: cat.toFixed(3), ...extra, ...bootInfo(params) },
   });
-  return Response.json({ key, cat, cx });
+  return Response.json({ key, cat, cx, aim, aimCx });
 }
 
 async function handleImage(request, env, key) {
