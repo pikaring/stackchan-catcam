@@ -32,26 +32,27 @@ static const int QUIET_END_HOUR = 6;
 // ---- 猫を探して中央に合わせる (首のヨー軸とピッチ軸) ----
 // Worker が返す猫の枠の中心 cx (0=左端, 1=右端)、cy (0=上端, 1=下端) から首の角度を決める。
 // ホームは setCurrentPostionAsHome() で部屋の見たい方向に合わせておく。
-// ピッチはいま動かさない: ライブラリはピッチを 0-90° に切り詰めるが、この個体では角度を増やすと下を向き、
-// ホームより下には動けない (2026-10-27 に +25° を指示したら下向きに押し付けた)。上を向く方法が決まるまで 0 に固定する
+// ピッチはホームが下限 (0) で、角度を増やすと上を向く (ライブラリの可動範囲は 0-90°、公式推奨は 5-85°)。
+// ホームは画面を台に垂直にした姿勢で設定する。保存されたゼロが物理的な下限より下にずれていると
+// 0 や小さい角度を指示しても首が下限に当たって動かない (2026-10-27 に設定し直して解消)
 static const bool ENABLE_CENTERING = true;
 static const float CAT_HINT_SCORE = 0.3f;      // これ以上なら「猫が少し写っている」とみなして向ける (送信対象は Worker の 0.6 以上)
 // 猫がいないときに見る向き {ヨー, ピッチ} (0.1度単位、この順に回る)。
-// 正面 → 右 → 左 (ピッチは 0 固定。上を向けられるようになったら斜め上の向きを足す)
+// 正面 → 右 → 斜め右上 → 上 → 斜め左上 → 左。猫は部屋の右上にいることが多い
 struct HeadPos {
   int yaw;
   int pitch;
 };
-static const HeadPos SEARCH_POSITIONS[] = {{0, 0}, {450, 0}, {-450, 0}};
+static const HeadPos SEARCH_POSITIONS[] = {{0, 0}, {450, 0}, {450, 250}, {0, 250}, {-450, 250}, {-450, 0}};
 static const int MAX_AIM_STEPS = 2;            // 中央に合わせ直す回数の上限 (端に少し写った猫は1回では中央に来ない)
 static const int MOVE_SPEED = 300;             // 0-1000。ゆっくり動かして音と猫への刺激を抑える
 static const float CAMERA_HFOV_DEG = 60.0f;    // カメラの水平画角 (仮の値。実機で合わせる)
 static const float CAMERA_VFOV_DEG = 45.0f;    // カメラの垂直画角 (水平 60° と 4:3 からの計算値)
 static const int YAW_SIGN = 1;                 // ヨー角を増やすと画像の右側を向く (実機で確認済み)
-static const int PITCH_SIGN = 1;               // ピッチ角を増やすと画像の上側を向く (ライブラリの説明より。実機で確認する)
+static const int PITCH_SIGN = 1;               // ピッチ角を増やすと画像の上側を向く (実機で確認済み)
 static const float CENTER_DEADBAND = 0.08f;    // 中央からのずれがこれ未満なら動かさない (画像幅に対する割合)
 static const int MAX_CENTER_YAW = 600;         // ホームから動かす上限 (0.1度単位)
-static const int MAX_PITCH = 0;                // 中央合わせでピッチを動かす上限 (0.1度単位)。0 なら上下は合わせない
+static const int MAX_PITCH = 400;              // ピッチを上げる上限 (0.1度単位)。下はホーム (0) まで
 static const uint32_t MOVE_TIMEOUT_MS = 8000;
 static const uint32_t MOTION_SETTLE_MS = 2000;  // 首を動かした後、自動露出が落ち着くまで動体検知を止める
 
