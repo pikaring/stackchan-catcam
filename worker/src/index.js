@@ -9,10 +9,9 @@ const CAT_SCORE_THRESHOLD = 0.6;
 const VISION_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
 const VISION_KINDS = ["hourly", "search", "center"];  // 動体検知の写真には使わない (回数を抑える)
 const AIM_HINT_SCORE = 0.3;   // ファームの CAT_HINT_SCORE と揃える。DETR がこれ未満のときだけ LLM に聞く
-const VISION_AIM_SCORE = 0.5; // LLM が猫ありと答えたときに返す aim
 const VISION_TIMEOUT_MS = 10000;
 const VISION_PROMPT =
-  'Is there a cat in this image? If yes, give the horizontal position of its center as a number from 0 (left edge) to 1 (right edge). Reply only JSON like {"cat":true,"x":0.4}.';
+  'Is there a cat in this image? If yes, give the position of its center: x from 0 (left edge) to 1 (right edge) and y from 0 (top edge) to 1 (bottom edge). Reply only JSON like {"cat":true,"x":0.4,"y":0.6}.';
 
 const encoder = new TextEncoder();
 
@@ -58,31 +57,32 @@ function authorized(request, env) {
   return env.UPLOAD_TOKEN && timingSafeEqual(header, `Bearer ${env.UPLOAD_TOKEN}`);
 }
 
-// 画像内で最もスコアの高い "cat" のスコアと、その枠の中心の横位置（0=左端, 1=右端）を返す。
-// 猫がいなければ cx は null。判定に失敗したら cat は -1（不明）
-export function bestCat(detections, width) {
+// 画像内で最もスコアの高い "cat" のスコアと、その枠の中心の位置を返す。
+// cx は横 (0=左端, 1=右端)、cy は縦 (0=上端, 1=下端)。猫がいなければ null。判定に失敗したら cat は -1（不明）
+export function bestCat(detections, width, height) {
   let best = null;
   for (const d of detections) {
     if (d.label === "cat" && (!best || d.score > best.score)) best = d;
   }
-  if (!best) return { cat: 0, cx: null };
-  const { xmin, xmax } = best.box || {};
-  let cx = null;
-  if (Number.isFinite(xmin) && Number.isFinite(xmax)) {
-    // 座標が 0-1 の正規化値ならそのまま、ピクセルなら画像幅で割る
-    const center = (xmin + xmax) / 2;
-    cx = xmax <= 1 ? center : width > 0 ? center / width : null;
-  }
-  return { cat: best.score, cx };
+  if (!best) return { cat: 0, cx: null, cy: null };
+  const { xmin, xmax, ymin, ymax } = best.box || {};
+  return { cat: best.score, cx: boxCenter(xmin, xmax, width), cy: boxCenter(ymin, ymax, height) };
 }
 
-async function detectCat(env, body, width) {
+// 座標が 0-1 の正規化値ならそのまま、ピクセルなら画像の幅 (高さ) で割る
+function boxCenter(min, max, size) {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+  const center = (min + max) / 2;
+  return max <= 1 ? center : size > 0 ? center / size : null;
+}
+
+async function detectCat(env, body, width, height) {
   try {
     const detections = await env.AI.run(DETECTION_MODEL, { image: [...new Uint8Array(body)] });
-    return bestCat(detections, width);
+    return bestCat(detections, width, height);
   } catch (err) {
     console.error("cat detection failed", err);
-    return { cat: -1, cx: null };
+    return { cat: -1, cx: null, cy: null };
   }
 }
 
@@ -97,15 +97,15 @@ export function bootInfo(params) {
   return info;
 }
 
-// LLM の返答から {cat, x} を取り出す。猫なし・読めなければ null
+// LLM の返答から {x, y} を取り出す。猫なし・読めなければ null
 export function parseVision(text) {
   const m = typeof text === "string" ? text.match(/\{[^}]*\}/) : null;
   if (!m) return null;
   try {
     const j = JSON.parse(m[0]);
     if (j.cat !== true) return null;
-    const x = Number(j.x);
-    return { x: Number.isFinite(x) && x >= 0 && x <= 1 ? x : null };
+    const unit = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= 1 ? Number(v) : null);
+    return { x: unit(j.x), y: unit(j.y) };
   } catch {
     return null;
   }
@@ -142,6 +142,7 @@ async function handleUpload(request, env) {
   const params = new URL(request.url).searchParams;
   const kind = ["motion", "center", "search"].includes(params.get("kind")) ? params.get("kind") : "hourly";
   const width = Number(params.get("w")) || 0;
+  const height = Number(params.get("h")) || 0;
   const body = await request.arrayBuffer();
   if (body.byteLength === 0 || body.byteLength > MAX_UPLOAD_BYTES) {
     return new Response("bad size", { status: 413 });
@@ -149,18 +150,14 @@ async function handleUpload(request, env) {
   const head = new Uint8Array(body, 0, 2);
   if (head[0] !== 0xff || head[1] !== 0xd8) return new Response("not a jpeg", { status: 400 });
 
-  const { cat, cx } = await detectCat(env, body, width);
-  // aim/aimCx は首の向きを決めるためだけの値。cat (DETR) は LINE の写真選びに使う
-  let aim = cat;
-  let aimCx = cx;
+  const { cat, cx, cy } = await detectCat(env, body, width, height);
+  // aim/aimCx/aimCy は首の向きを決める値。いまは物体検出 (DETR) の結果そのまま。
+  // LLM は猫のいない写真にも「猫あり」と答え、位置もプロンプトの例を写すだけだった (2026-10-27) ので、
+  // 答えはメタデータ (vision) に残すだけにして首の向きには使わない
   const extra = {};
   if (cat >= 0 && cat < AIM_HINT_SCORE && VISION_KINDS.includes(kind)) {
     const vision = await askVision(env, body);
     if (vision.answered) extra.vision = vision.cat ? "cat" : "none";
-    if (vision.cat) {
-      aim = VISION_AIM_SCORE;
-      aimCx = vision.cat.x;
-    }
   }
   const { date, time } = jstNow();
   const key = `photos/${date}/${time}-${kind}.jpg`;
@@ -168,7 +165,7 @@ async function handleUpload(request, env) {
     httpMetadata: { contentType: "image/jpeg" },
     customMetadata: { kind, cat: cat.toFixed(3), ...extra, ...bootInfo(params) },
   });
-  return Response.json({ key, cat, cx, aim, aimCx });
+  return Response.json({ key, cat, cx, cy, aim: cat, aimCx: cx, aimCy: cy });
 }
 
 async function handleImage(request, env, key) {

@@ -29,20 +29,36 @@ static const uint32_t DISPLAY_SLEEP_MS = 15UL * 1000UL;    // 起動後、画面
 static const int QUIET_START_HOUR = 0;
 static const int QUIET_END_HOUR = 6;
 
-// ---- 猫を探して中央に合わせる (首のヨー軸) ----
-// Worker が返す猫の枠の中心 cx (0=左端, 1=右端) から首の角度を決める。
-// ホームは setCurrentPostionAsHome() で部屋の見たい方向に合わせておく
+// ---- 猫を探して中央に合わせる (首のヨー軸とピッチ軸) ----
+// Worker が返す猫の枠の中心 cx (0=左端, 1=右端)、cy (0=上端, 1=下端) から首の角度を決める。
+// ホームは setCurrentPostionAsHome() で部屋の見たい方向に合わせておく。
+// ピッチはいま動かさない: ライブラリはピッチを 0-90° に切り詰めるが、この個体では角度を増やすと下を向き、
+// ホームより下には動けない (2026-10-27 に +25° を指示したら下向きに押し付けた)。上を向く方法が決まるまで 0 に固定する
 static const bool ENABLE_CENTERING = true;
 static const float CAT_HINT_SCORE = 0.3f;      // これ以上なら「猫が少し写っている」とみなして向ける (送信対象は Worker の 0.6 以上)
-static const int SEARCH_YAWS[] = {0, 450, -450};  // 猫がいないときに見る向き (0.1度単位、この順に回る)
+// 猫がいないときに見る向き {ヨー, ピッチ} (0.1度単位、この順に回る)。
+// 正面 → 右 → 左 (ピッチは 0 固定。上を向けられるようになったら斜め上の向きを足す)
+struct HeadPos {
+  int yaw;
+  int pitch;
+};
+static const HeadPos SEARCH_POSITIONS[] = {{0, 0}, {450, 0}, {-450, 0}};
 static const int MAX_AIM_STEPS = 2;            // 中央に合わせ直す回数の上限 (端に少し写った猫は1回では中央に来ない)
 static const int MOVE_SPEED = 300;             // 0-1000。ゆっくり動かして音と猫への刺激を抑える
 static const float CAMERA_HFOV_DEG = 60.0f;    // カメラの水平画角 (仮の値。実機で合わせる)
+static const float CAMERA_VFOV_DEG = 45.0f;    // カメラの垂直画角 (水平 60° と 4:3 からの計算値)
 static const int YAW_SIGN = 1;                 // ヨー角を増やすと画像の右側を向く (実機で確認済み)
+static const int PITCH_SIGN = 1;               // ピッチ角を増やすと画像の上側を向く (ライブラリの説明より。実機で確認する)
 static const float CENTER_DEADBAND = 0.08f;    // 中央からのずれがこれ未満なら動かさない (画像幅に対する割合)
 static const int MAX_CENTER_YAW = 600;         // ホームから動かす上限 (0.1度単位)
+static const int MAX_PITCH = 0;                // 中央合わせでピッチを動かす上限 (0.1度単位)。0 なら上下は合わせない
 static const uint32_t MOVE_TIMEOUT_MS = 8000;
 static const uint32_t MOTION_SETTLE_MS = 2000;  // 首を動かした後、自動露出が落ち着くまで動体検知を止める
+
+// 部屋が暗いときは撮らない (真っ暗な写真と、暗い所のノイズによる動体の誤検知を避ける)。
+// 画面の平均輝度 (緑成分、0-255) がこれ未満なら暗いとみなす。
+// 実測: 夜の照明下で 45-60、消灯後や朝6時の暗い部屋で 13-29
+static const uint8_t DARK_LUMA = 35;
 
 // 動体検知はフレームを GRID_W x GRID_H のセルに間引いて比較する
 static const int GRID_W = 80;
@@ -50,11 +66,13 @@ static const int GRID_H = 60;
 
 static uint8_t background[GRID_W * GRID_H];
 static bool backgroundReady = false;
+static bool dark = false;  // 最後に見たフレームが暗かった
 static uint8_t motionStreak = 0;
 static uint32_t motionResumeMs = 0;
 
 static GC0308 Camera;
 static int currentYaw = 0;  // 0.1度単位。最後に猫を見つけた角度から次の周期を始める
+static int currentPitch = 0;
 
 static uint32_t lastHourlyMs = 0;
 static uint32_t lastMotionShotMs = 0;
@@ -104,9 +122,18 @@ static bool ensureWifi() {
 }
 
 // 時刻がまだ取れていなければ true (夜中の再起動で撮らないよう、時刻が分かるまで止まる)
+// 今の時刻 (JST) を読む。まだ NTP で合わせていなければ false。
+// getLocalTime(&t, 0) は呼んだ瞬間に millis() が進むと一度も時刻を読まずに false を返すので使わない
+// (それで夜間停止→再開が誤って起き、1時間ごとの撮影が早まっていた)
+static bool readLocalTime(struct tm* t) {
+  time_t now = time(nullptr);
+  localtime_r(&now, t);
+  return t->tm_year > (2016 - 1900);
+}
+
 static bool isQuietHours() {
   struct tm t;
-  if (!getLocalTime(&t, 0)) return true;
+  if (!readLocalTime(&t)) return true;
   if (QUIET_START_HOUR <= QUIET_END_HOUR) return t.tm_hour >= QUIET_START_HOUR && t.tm_hour < QUIET_END_HOUR;
   return t.tm_hour >= QUIET_START_HOUR || t.tm_hour < QUIET_END_HOUR;  // 日付をまたぐ
 }
@@ -167,12 +194,31 @@ static bool detectMotion(const camera_fb_t* fb) {
   return motionStreak >= MOTION_CONFIRM_FRAMES;
 }
 
+// フレームの平均輝度 (動体検知と同じセルで間引いて求める)
+static uint8_t frameLuma(const camera_fb_t* fb) {
+  const int stepX = fb->width / GRID_W;
+  const int stepY = fb->height / GRID_H;
+  uint32_t sum = 0;
+  for (int gy = 0; gy < GRID_H; gy++) {
+    for (int gx = 0; gx < GRID_W; gx++) sum += lumaAt(fb, gx * stepX, gy * stepY);
+  }
+  return sum / (GRID_W * GRID_H);
+}
+
+// 明るさが変わったときだけ表示する
+static void setDark(bool now) {
+  if (now == dark) return;
+  dark = now;
+  showStatus(dark ? "too dark: not shooting" : "light: shooting resumed");
+}
+
 // アップロードして、首の向きを決めるための猫スコア (Worker の aim) を返す。
 // aim は物体検出のスコア。物体検出が見落としたときは画像を読む LLM の判定で補った値になる。
 // 0以上: 猫スコア / -1: Worker の猫判定が失敗 / -2: アップロード失敗
-// cx には猫の中心の横位置 (0-1) を入れる。猫がいない・位置が返らなければ -1
-static float upload(const camera_fb_t* fb, const char* kind, float* cx) {
+// cx, cy には猫の中心の位置 (0-1) を入れる。猫がいない・位置が返らなければ -1
+static float upload(const camera_fb_t* fb, const char* kind, float* cx, float* cy) {
   *cx = -1.0f;
+  *cy = -1.0f;
   uint8_t* jpg = nullptr;
   size_t jpgLen = 0;
   if (!frame2jpg(const_cast<camera_fb_t*>(fb), 100 - JPEG_QUALITY, &jpg, &jpgLen)) {
@@ -185,14 +231,14 @@ static float upload(const camera_fb_t* fb, const char* kind, float* cx) {
     WiFiClientSecure client;
     client.setInsecure();  // 証明書検証なし。気になる場合は setCACert で固定する
     HTTPClient http;
-    String url = String(UPLOAD_URL) + "?kind=" + kind + "&w=" + fb->width + bootInfo;
+    String url = String(UPLOAD_URL) + "?kind=" + kind + "&w=" + fb->width + "&h=" + fb->height + bootInfo;
     if (http.begin(client, url)) {
       http.setTimeout(30000);  // Worker 側の猫判定 (物体検出 + LLM) ぶん待つ
       http.addHeader("Authorization", String("Bearer ") + UPLOAD_TOKEN);
       http.addHeader("Content-Type", "image/jpeg");
       int code = http.POST(jpg, jpgLen);
       if (code >= 200 && code < 300) {
-        // レスポンスは {"key":"...","cat":0.93,"cx":0.42,"aim":0.93,"aimCx":0.42}。位置がなければ null
+        // レスポンスは {"key":"...","cat":0.93,"cx":0.42,"cy":0.3,"aim":0.93,"aimCx":0.42,"aimCy":0.3}。位置がなければ null
         String body = http.getString();
         int at = body.indexOf("\"cat\":");
         catScore = at >= 0 ? body.substring(at + 6).toFloat() : -1.0f;
@@ -200,10 +246,13 @@ static float upload(const camera_fb_t* fb, const char* kind, float* cx) {
         score = at >= 0 ? body.substring(at + 6).toFloat() : catScore;
         at = body.indexOf("\"aimCx\":");
         if (at >= 0 && !body.substring(at + 8).startsWith("null")) *cx = body.substring(at + 8).toFloat();
+        at = body.indexOf("\"aimCy\":");
+        if (at >= 0 && !body.substring(at + 8).startsWith("null")) *cy = body.substring(at + 8).toFloat();
         bootInfo = "";
       }
-      char msg[80];
-      snprintf(msg, sizeof(msg), "%s: %d cat=%.2f aim=%.2f cx=%.2f yaw=%d", kind, code, catScore, score, *cx, currentYaw);
+      char msg[96];
+      snprintf(msg, sizeof(msg), "%s: %d cat=%.2f aim=%.2f cx=%.2f cy=%.2f yaw=%d pitch=%d", kind, code, catScore, score,
+               *cx, *cy, currentYaw, currentPitch);
       showStatus(msg);
       http.end();
     }
@@ -215,8 +264,10 @@ static float upload(const camera_fb_t* fb, const char* kind, float* cx) {
 }
 
 // 撮影してアップロード。AE が落ち着くよう数フレーム捨ててから撮る。
-static float captureAndUpload(const char* kind, float* cx) {
+// 返り値は upload() と同じ。暗くて撮らなかったときは -3
+static float captureAndUpload(const char* kind, float* cx, float* cy) {
   *cx = -1.0f;
+  *cy = -1.0f;
   for (int i = 0; i < 5; i++) {
     if (Camera.get()) Camera.free();
   }
@@ -224,14 +275,18 @@ static float captureAndUpload(const char* kind, float* cx) {
     showStatus("capture failed");
     return -2.0f;
   }
-  float score = upload(Camera.fb, kind, cx);
+  setDark(frameLuma(Camera.fb) < DARK_LUMA);
+  if (dark) {
+    Camera.free();
+    return -3.0f;
+  }
+  float score = upload(Camera.fb, kind, cx, cy);
   Camera.free();
   return score;
 }
 
-// 首を動かして、止まるまで待つ。動かした後は動体検知の背景を取り直す。
-static void moveYawTo(int yaw) {
-  M5StackChan.Motion.moveYaw(yaw, MOVE_SPEED);
+// 動き出した首が止まるまで待つ
+static void waitForHead() {
   uint32_t start = millis();
   delay(100);
   while (M5StackChan.Motion.isMoving() && millis() - start < MOVE_TIMEOUT_MS) {
@@ -240,54 +295,75 @@ static void moveYawTo(int yaw) {
   }
   if (M5StackChan.Motion.isMoving()) M5StackChan.Motion.stop();
   delay(500);  // 揺れが収まるのを待つ
+}
+
+// 首を動かして、止まるまで待つ。サーボに一度にかかる負担を抑えるため、ヨーとピッチは片方ずつ動かす。
+// force なら今の角度と同じでも動かす (起動直後は実際の角度が分からないため)。
+// 動かした後は動体検知の背景を取り直す。
+static void moveHeadTo(int yaw, int pitch, bool force = false) {
+  if (force || yaw != currentYaw) {
+    M5StackChan.Motion.moveYaw(yaw, MOVE_SPEED);
+    waitForHead();
+  }
+  if (force || pitch != currentPitch) {
+    M5StackChan.Motion.movePitch(pitch, MOVE_SPEED);
+    waitForHead();
+  }
   currentYaw = yaw;
+  currentPitch = pitch;
   backgroundReady = false;
   motionStreak = 0;
   motionResumeMs = millis() + MOTION_SETTLE_MS;
 }
 
-// 猫が写真の中央からずれていれば、首を回して中央に合わせてもう1枚撮る。
+static bool atHome() { return currentYaw == 0 && currentPitch == 0; }
+
+// 猫が写真の中央からずれていれば、首を左右・上下に動かして中央に合わせてもう1枚撮る。
 // 合わせた後も猫が写っていてまだずれていれば、MAX_AIM_STEPS 回まで繰り返す。
+// 縦の位置が返らなければ (cy < 0) 左右だけ合わせる。
 // 最後に撮った写真の猫スコアを返す (猫を見失ったら CAT_HINT_SCORE 未満)
-static float centerOnCat(float score, float cx) {
+static float centerOnCat(float score, float cx, float cy) {
   for (int step = 0; step < MAX_AIM_STEPS; step++) {
     if (score < CAT_HINT_SCORE || cx < 0) return score;  // 猫を見失った / Worker が位置を返さなかった
-    float offset = cx - 0.5f;
-    if (fabsf(offset) < CENTER_DEADBAND) return score;
-    int yaw = currentYaw + YAW_SIGN * (int)lroundf(offset * CAMERA_HFOV_DEG * 10.0f);
-    if (yaw > MAX_CENTER_YAW) yaw = MAX_CENTER_YAW;
-    if (yaw < -MAX_CENTER_YAW) yaw = -MAX_CENTER_YAW;
-    if (yaw == currentYaw) return score;
-    moveYawTo(yaw);
-    score = captureAndUpload("center", &cx);
+    float offsetX = cx - 0.5f;
+    float offsetY = cy >= 0 ? 0.5f - cy : 0.0f;  // 上にずれていれば正
+    int yaw = currentYaw;
+    int pitch = currentPitch;
+    if (fabsf(offsetX) >= CENTER_DEADBAND) yaw += YAW_SIGN * (int)lroundf(offsetX * CAMERA_HFOV_DEG * 10.0f);
+    if (fabsf(offsetY) >= CENTER_DEADBAND) pitch += PITCH_SIGN * (int)lroundf(offsetY * CAMERA_VFOV_DEG * 10.0f);
+    yaw = constrain(yaw, -MAX_CENTER_YAW, MAX_CENTER_YAW);
+    pitch = constrain(pitch, 0, MAX_PITCH);
+    if (yaw == currentYaw && pitch == currentPitch) return score;
+    moveHeadTo(yaw, pitch);
+    score = captureAndUpload("center", &cx, &cy);
   }
   return score;
 }
 
 // 今の向きで撮り、猫が少しでも写っていれば中央に合わせる。
-// 写っていなければ SEARCH_YAWS の向きを順に見て回り、どこにもいなければホームに戻る。
+// 写っていなければ SEARCH_POSITIONS の向きを順に見て回り、見つけた所で中央に合わせる。どこにもいなければホームに戻る。
 // 中央に合わせる途中で猫を見失ったときもホームに戻る。
 static void hourlyRound() {
-  float cx;
-  float score = captureAndUpload("hourly", &cx);
-  if (score < 0) return;  // -1 判定失敗 / -2 通信失敗のときは首を動かさない
+  float cx, cy;
+  float score = captureAndUpload("hourly", &cx, &cy);
+  if (score < 0) return;  // -1 判定失敗 / -2 通信失敗 / -3 暗いときは首を動かさない
   if (ENABLE_CENTERING && score >= CAT_HINT_SCORE) {
-    if (centerOnCat(score, cx) < CAT_HINT_SCORE && currentYaw != 0) moveYawTo(0);
+    if (centerOnCat(score, cx, cy) < CAT_HINT_SCORE && !atHome()) moveHeadTo(0, 0);
     return;
   }
   if (ENABLE_CENTERING) {
-    for (int yaw : SEARCH_YAWS) {
-      if (yaw == currentYaw) continue;  // この向きはもう撮った
-      moveYawTo(yaw);
-      score = captureAndUpload("search", &cx);
+    for (const HeadPos& pos : SEARCH_POSITIONS) {
+      if (pos.yaw == currentYaw && pos.pitch == currentPitch) continue;  // この向きはもう撮った
+      moveHeadTo(pos.yaw, pos.pitch);
+      score = captureAndUpload("search", &cx, &cy);
       if (score < 0) break;
       if (score >= CAT_HINT_SCORE) {
-        if (centerOnCat(score, cx) >= CAT_HINT_SCORE) return;
+        if (centerOnCat(score, cx, cy) >= CAT_HINT_SCORE) return;
         break;  // 見失ったらホームに戻る
       }
     }
   }
-  if (currentYaw != 0) moveYawTo(0);  // 猫がいなければホームを向いて動体検知に戻る
+  if (!atHome()) moveHeadTo(0, 0);  // 猫がいなければホームを向いて動体検知に戻る
 }
 
 void setup() {
@@ -312,8 +388,8 @@ void setup() {
     while (true) delay(1000);
   }
 
-  // 首は起動時の角度のままなので、ホームに戻して currentYaw = 0 と実際を揃える (ピッチは動かさない)
-  moveYawTo(0);
+  // 首は起動時の角度のままなので、ホームに戻して currentYaw/currentPitch = 0 と実際を揃える
+  moveHeadTo(0, 0, true);
 
   showStatus("connecting wifi...");
   WiFi.mode(WIFI_STA);
@@ -360,7 +436,7 @@ void loop() {
   if (quiet != paused) {
     paused = quiet;
     showStatus(paused ? "quiet hours: paused" : "quiet hours: resumed");
-    if (paused && currentYaw != 0) moveYawTo(0);  // 夜の間はホームを向いて止まる
+    if (paused && !atHome()) moveHeadTo(0, 0);  // 夜の間はホームを向いて止まる
     if (!paused) {
       motionShotsToday = 0;
       backgroundReady = false;
@@ -372,7 +448,7 @@ void loop() {
   if (paused) {
     // 時刻が取れていなければ Wi-Fi を繋ぎ直す (繋がれば SNTP が時刻を合わせる)
     struct tm t;
-    if (!getLocalTime(&t, 0) && now - lastWifiRetryMs >= WIFI_RETRY_MS) {
+    if (!readLocalTime(&t) && now - lastWifiRetryMs >= WIFI_RETRY_MS) {
       lastWifiRetryMs = now;
       ensureWifi();
     }
@@ -396,6 +472,15 @@ void loop() {
     delay(50);
     return;
   }
+  // 暗いときは動体検知もしない。明るくなったら背景を取り直す
+  setDark(frameLuma(Camera.fb) < DARK_LUMA);
+  if (dark) {
+    Camera.free();
+    backgroundReady = false;
+    motionStreak = 0;
+    delay(500);
+    return;
+  }
   bool motion = detectMotion(Camera.fb);
   Camera.free();
 
@@ -404,8 +489,8 @@ void loop() {
     lastMotionShotMs = now;
     motionShotsToday++;
     motionStreak = 0;
-    float cx;
-    captureAndUpload("motion", &cx);  // 動体検知では首を動かさない (猫を驚かせないように)
+    float cx, cy;
+    captureAndUpload("motion", &cx, &cy);  // 動体検知では首を動かさない (猫を驚かせないように)
     backgroundReady = false;  // 撮影中の時間経過ぶん背景を取り直す
   }
   delay(50);
