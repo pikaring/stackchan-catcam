@@ -26,4 +26,4 @@ PUBLIC_BASE_URL = "https://stackchan-catcam.pikaring-0e1.workers.dev"
 LINE_TO = ""
 
 # secrets (wrangler secret put):
-#   UPLOAD_TOKEN, SIGNING_SECRET, LINE_CHANNEL_ACCESS_TOKEN
+#   UPLOAD_TOKEN, SIGNING_SECRET, LINE_CHANNEL_ACCESS_TOKEN, ANTHROPIC_API_KEY

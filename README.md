@@ -28,10 +28,13 @@ Stack-chan --HTTPS POST--> Cloudflare Worker --> R2 (写真保存)
   どこにもいなければ、また中央に合わせる途中で猫を見失ったときはホームに戻る。猫を見つけたときは、その向きのまま次の1時間の動体検知をする。
   起動時と夜間停止に入るときもホームに戻す。動体検知では首を動かさない。首が動いた後は動体検知の背景を取り直す。
 - 猫判定: アップロード時に Workers AI の物体検出（`@cf/facebook/detr-resnet-50`）で "cat" のスコアを求め、R2のメタデータ（`cat`）に保存する。判定失敗は `-1`（不明）で、送信対象にならない。
-- 画像を読む LLM の判定（記録だけ）: 1時間ごと・探索・中央合わせの写真で物体検出のスコアが 0.3 未満なら、
-  LLM（`@cf/mistralai/mistral-small-3.1-24b-instruct`）にも猫の有無と位置を聞き、答えを R2 のメタデータ（`vision`: cat / none）に残す。
-  ただし 2026-10-27 に調べると、猫のいない写真にも「猫あり」と答え、位置もプロンプトの例の値を返すだけだった（Llama 4 Scout も同様）。
-  そのため首の向き（Worker が返す `aim` / `aimCx` / `aimCy`）は物体検出の結果だけで決める。物体検出は柵越しや影の猫を見落とす。
+- 首の向きを決める2つ目の判定: 物体検出は柵越しや影の猫を見落とすので、1時間ごと・探索・中央合わせの写真で物体検出のスコアが 0.3 未満なら、
+  Claude Haiku（`claude-haiku-5-5`、Anthropic API）に猫の有無と位置を聞き、猫ありなら `aim`=0.5 と位置（`aimCx` / `aimCy`）をファームに返す。
+  ファームは首の向きにだけ `aim` を使う。見間違いもあるので、LINE の写真選びには物体検出の `cat` だけを使う。
+  答えは R2 のメタデータ（`vision`: cat / none、位置は `vx` / `vy`）に残す。動体検知の写真には使わない。
+  2026-10-27 に今日の写真13枚で試すと、ケージ上段の柵越しの猫を位置まで当てた（誤検知の疑い2枚、大きくぶれた至近の猫1枚を見落とし）。
+  料金は1枚約 $0.00015（1日100枚で月 $0.4 ほど）。Max などのサブスクリプションとは別に API の料金がかかる。
+  Workers AI の LLM（Mistral Small 3.1、Llama 4 Scout）は猫のいない写真にも猫ありと答え、位置もプロンプトの例を写すだけだったので使わない。
 - 4枚の選び方: スコア0.6以上の写真だけを対象に、時系列で4等分した各区間から猫スコア最大の1枚ずつ。対象が4枚以下ならそのまま全部。
   猫が1枚も写っていない日は「猫が写った写真がありませんでした」というテキストを送る。
 - LINEはメッセージ1通（2x2のFlex）にまとめている。メッセージ数の無料枠に収めるため。
@@ -40,10 +43,12 @@ Stack-chan --HTTPS POST--> Cloudflare Worker --> R2 (写真保存)
 
 ```sh
 cd worker
+npm install                                       # Anthropic SDK
 npx wrangler r2 bucket create stackchan-catcam
 npx wrangler secret put UPLOAD_TOKEN              # 適当な長いランダム文字列
 npx wrangler secret put SIGNING_SECRET            # 同上（画像URLの署名用）
 npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN # 下記のLINE設定で取得
+npx wrangler secret put ANTHROPIC_API_KEY         # 首向けの2つ目の判定 (Claude Haiku)。なければ物体検出だけで決める
 npx wrangler deploy
 ```
 

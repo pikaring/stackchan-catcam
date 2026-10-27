@@ -1,17 +1,26 @@
+import Anthropic from "@anthropic-ai/sdk";
+
 const JST_OFFSET_MS = 9 * 3600 * 1000;
 const MAX_UPLOAD_BYTES = 1024 * 1024;
 const URL_LIFETIME_SEC = 30 * 24 * 3600;
 const DIGEST_PHOTO_COUNT = 4;
 const DETECTION_MODEL = "@cf/facebook/detr-resnet-50";
 const CAT_SCORE_THRESHOLD = 0.6;
-// 首の向きを決めるための2つ目の判定 (画像を読める LLM)。DETR は暗い所で丸まった黒猫を見落とすため。
-// 見間違いもあるので LINE の写真選びには使わず、首を向ける (aim) だけに使う
-const VISION_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
+// 首の向きを決めるための2つ目の判定 (Claude Haiku)。DETR は柵越しや影の猫を見落とすため。
+// 見間違いもあるので LINE の写真選びには使わず、首を向ける (aim) だけに使う。
+// Workers AI の LLM (Mistral / Llama 4 Scout) は猫のいない写真にも猫ありと答え、位置も当たらなかった (2026-10-27)
+const VISION_MODEL = "claude-haiku-5-5";
+const VISION_AIM_SCORE = 0.5; // LLM が猫ありと答えたときに返す aim (ファームの CAT_HINT_SCORE 以上)
 const VISION_KINDS = ["hourly", "search", "center"];  // 動体検知の写真には使わない (回数を抑える)
 const AIM_HINT_SCORE = 0.3;   // ファームの CAT_HINT_SCORE と揃える。DETR がこれ未満のときだけ LLM に聞く
 const VISION_TIMEOUT_MS = 10000;
+// 例に数値を書くと、そのまま写して返すモデルがあったので書かない
 const VISION_PROMPT =
-  'Is there a cat in this image? If yes, give the position of its center: x from 0 (left edge) to 1 (right edge) and y from 0 (top edge) to 1 (bottom edge). Reply only JSON like {"cat":true,"x":0.4,"y":0.6}.';
+  "This is a photo from a pet camera in a room with a wire cat cage. " +
+  "Is there a cat anywhere in the image? Cats may be partly hidden behind cage bars, in shadow, or on a shelf. " +
+  "If there is a cat, give the center of its body as fractions of the image size: " +
+  "x from 0 (left edge) to 1 (right edge), y from 0 (top edge) to 1 (bottom edge). " +
+  'Reply with only JSON: {"cat": false} or {"cat": true, "x": <number>, "y": <number>}.';
 
 const encoder = new TextEncoder();
 
@@ -112,27 +121,30 @@ export function parseVision(text) {
 }
 
 async function askVision(env, body) {
-  const b64 = btoa(Array.from(new Uint8Array(body), (c) => String.fromCharCode(c)).join(""));
-  const run = env.AI.run(VISION_MODEL, {
-    max_tokens: 60,
-    temperature: 0,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: VISION_PROMPT },
-          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${b64}` } },
-        ],
-      },
-    ],
-  });
-  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), VISION_TIMEOUT_MS));
+  if (!env.ANTHROPIC_API_KEY) return { answered: false, cat: null };
+  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY, timeout: VISION_TIMEOUT_MS, maxRetries: 0 });
+  const data = btoa(Array.from(new Uint8Array(body), (c) => String.fromCharCode(c)).join(""));
   try {
-    const out = await Promise.race([run, timeout]);
-    const text = out?.choices?.[0]?.message?.content ?? (typeof out?.response === "string" ? out.response : JSON.stringify(out?.response ?? ""));
+    const msg = await client.messages.create({
+      model: VISION_MODEL,
+      max_tokens: 1024,
+      output_config: { effort: "low" },
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data } },
+            { type: "text", text: VISION_PROMPT },
+          ],
+        },
+      ],
+    });
+    if (msg.stop_reason === "refusal") return { answered: false, cat: null };
+    // 答えの前に説明文が付くことがあるので、parseVision が JSON の部分だけを読む
+    const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
     return { answered: true, cat: parseVision(text) };
   } catch (err) {
-    console.error("vision check failed", err);
+    console.error("vision check failed", err instanceof Anthropic.APIError ? `${err.status} ${err.message}` : err);
     return { answered: false, cat: null };
   }
 }
@@ -151,13 +163,21 @@ async function handleUpload(request, env) {
   if (head[0] !== 0xff || head[1] !== 0xd8) return new Response("not a jpeg", { status: 400 });
 
   const { cat, cx, cy } = await detectCat(env, body, width, height);
-  // aim/aimCx/aimCy は首の向きを決める値。いまは物体検出 (DETR) の結果そのまま。
-  // LLM は猫のいない写真にも「猫あり」と答え、位置もプロンプトの例を写すだけだった (2026-10-27) ので、
-  // 答えはメタデータ (vision) に残すだけにして首の向きには使わない
+  // aim/aimCx/aimCy は首の向きを決めるためだけの値。cat (DETR) は LINE の写真選びに使う
+  let aim = cat;
+  let aimCx = cx;
+  let aimCy = cy;
   const extra = {};
   if (cat >= 0 && cat < AIM_HINT_SCORE && VISION_KINDS.includes(kind)) {
     const vision = await askVision(env, body);
     if (vision.answered) extra.vision = vision.cat ? "cat" : "none";
+    if (vision.cat) {
+      aim = VISION_AIM_SCORE;
+      aimCx = vision.cat.x;
+      aimCy = vision.cat.y;
+      if (aimCx !== null) extra.vx = aimCx.toFixed(2);
+      if (aimCy !== null) extra.vy = aimCy.toFixed(2);
+    }
   }
   const { date, time } = jstNow();
   const key = `photos/${date}/${time}-${kind}.jpg`;
@@ -165,7 +185,7 @@ async function handleUpload(request, env) {
     httpMetadata: { contentType: "image/jpeg" },
     customMetadata: { kind, cat: cat.toFixed(3), ...extra, ...bootInfo(params) },
   });
-  return Response.json({ key, cat, cx, cy, aim: cat, aimCx: cx, aimCy: cy });
+  return Response.json({ key, cat, cx, cy, aim, aimCx, aimCy });
 }
 
 async function handleImage(request, env, key) {
