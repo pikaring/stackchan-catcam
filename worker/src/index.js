@@ -66,16 +66,27 @@ function authorized(request, env) {
   return env.UPLOAD_TOKEN && timingSafeEqual(header, `Bearer ${env.UPLOAD_TOKEN}`);
 }
 
-// 画像内で最もスコアの高い "cat" のスコアと、その枠の中心の位置を返す。
+// 画像内で最もスコアの高い "cat" のスコアと、首を向ける猫の枠の中心の位置を返す。
+// 首を向けるのは AIM_HINT_SCORE 以上の猫のうち、枠がいちばん大きいもの。遠くの棚のぬいぐるみが
+// 本物の猫より高いスコアで猫と判定され、首が本物の猫から離れたことがあった (2026-10-28)。近くの本物の猫は大きく写る。
 // cx は横 (0=左端, 1=右端)、cy は縦 (0=上端, 1=下端)。猫がいなければ null。判定に失敗したら cat は -1（不明）
 export function bestCat(detections, width, height) {
   let best = null;
+  let biggest = null;
   for (const d of detections) {
-    if (d.label === "cat" && (!best || d.score > best.score)) best = d;
+    if (d.label !== "cat") continue;
+    if (!best || d.score > best.score) best = d;
+    if (d.score >= AIM_HINT_SCORE && (!biggest || boxArea(d.box) > boxArea(biggest.box))) biggest = d;
   }
   if (!best) return { cat: 0, cx: null, cy: null };
-  const { xmin, xmax, ymin, ymax } = best.box || {};
+  const { xmin, xmax, ymin, ymax } = (biggest || best).box || {};
   return { cat: best.score, cx: boxCenter(xmin, xmax, width), cy: boxCenter(ymin, ymax, height) };
+}
+
+function boxArea(box) {
+  const { xmin, xmax, ymin, ymax } = box || {};
+  const area = (xmax - xmin) * (ymax - ymin);
+  return Number.isFinite(area) ? area : 0;
 }
 
 // 座標が 0-1 の正規化値ならそのまま、ピクセルなら画像の幅 (高さ) で割る
