@@ -11,6 +11,7 @@
 #include <HTTPClient.h>
 #include "img_converters.h"
 #include "gc0308.h"
+#include "clawd.h"
 #include "secrets.h"
 
 // ---- 調整用パラメータ ----
@@ -21,7 +22,8 @@ static const uint8_t JPEG_QUALITY = 12;                    // 小さいほど高
 static const uint8_t CELL_DIFF_THRESHOLD = 24;             // 1セルの輝度差がこれ以上で「変化」
 static const float MOTION_RATIO = 0.04f;                   // 変化セルがこの割合以上で動体とみなす
 static const uint8_t MOTION_CONFIRM_FRAMES = 2;            // 連続して検知したら確定 (ノイズ対策)
-static const uint32_t DISPLAY_SLEEP_MS = 15UL * 1000UL;    // 起動後、画面を消すまでの時間
+static const uint32_t DISPLAY_DIM_MS = 15UL * 1000UL;      // 起動後、画面を暗くするまでの時間
+static const uint8_t DISPLAY_DIM_BRIGHTNESS = 24;           // 暗くした後の明るさ (0-255)。動いていると分かる程度で、猫が気にしないよう暗め
 
 // ---- 夜間停止 (JST) ----
 // QUIET_START_HOUR 時から QUIET_END_HOUR 時までは撮影も首振りもしない (日付をまたいでもよい)。
@@ -72,6 +74,7 @@ static uint8_t motionStreak = 0;
 static uint32_t motionResumeMs = 0;
 
 static GC0308 Camera;
+static clawd::Animator Clawd;  // 画面のマスコット。動いていることを示す
 static int currentYaw = 0;  // 0.1度単位。最後に猫を見つけた角度から次の周期を始める
 static int currentPitch = 0;
 
@@ -372,6 +375,7 @@ void setup() {
   Serial.begin(115200);
   M5StackChan.Display().setTextSize(1);
   M5StackChan.Display().setTextColor(TFT_WHITE, TFT_BLACK);
+  Clawd.begin(&M5StackChan.Display());
 
   if (bootMagic != 0xCA7CA7) {
     bootMagic = 0xCA7CA7;
@@ -424,8 +428,10 @@ void loop() {
   M5StackChan.update();
   uint32_t now = millis();
 
-  // 起動後しばらくしたら画面を消す (猫が気にしないように・省電力)
-  if (now > DISPLAY_SLEEP_MS) M5StackChan.Display().setBrightness(0);
+  // 起動後しばらくしたら画面を暗くする (猫が気にしないように・省電力)。
+  // 消すと動いているか分からないので、暗いまま Clawd を動かし続ける (夜間や暗いときは眠る)
+  if (now > DISPLAY_DIM_MS) M5StackChan.Display().setBrightness(DISPLAY_DIM_BRIGHTNESS);
+  Clawd.update(now, paused || dark);
 
   if (now - dayStartMs >= 24UL * 60UL * 60UL * 1000UL) {
     dayStartMs = now;

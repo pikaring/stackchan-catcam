@@ -99,7 +99,13 @@ pio run -t upload
 pio device monitor
 ```
 
-起動時に1枚撮ってアップロードする（疎通確認）。画面は15秒で消え、タッチで再点灯する。
+起動時に1枚撮ってアップロードする（疎通確認）。画面は15秒で暗くなる（明るさ `DISPLAY_DIM_BRIGHTNESS`）。
+消すと動いているか分からないので、画面には Claude のマスコット（Clawd）を出し続ける（`src/clawd.h`）。
+撮影できる間は 4 秒おきにアニメーションを再生する。夜間停止中や部屋が暗いときは目を閉じたドット絵で眠る（z が出る）。
+1時間ごとの撮影と首振りの間（数十秒）はアニメーションが止まる。
+アニメーションは "Free claude Animation" by Fausto Villalba on LottieFiles
+（https://lottiefiles.com/free-animation/claude-h8K0CcrGcz 、[Lottie Simple License](https://lottiefiles.com/page/license)）を
+`tools/make_clawd_frames.py` で縮小・減色して `src/clawd_frames.h` に埋め込んだもの。
 
 ## 調整
 
