@@ -59,9 +59,11 @@ static const uint32_t MOVE_TIMEOUT_MS = 8000;
 static const uint32_t MOTION_SETTLE_MS = 2000;  // 首を動かした後、自動露出が落ち着くまで動体検知を止める
 
 // 部屋が暗いときは撮らない (真っ暗な写真と、暗い所のノイズによる動体の誤検知を避ける)。
-// 画面の平均輝度 (緑成分、0-255) がこれ未満なら暗いとみなす。
-// 実測: 夜の照明下で 45-60、消灯後や朝6時の暗い部屋で 13-29
-static const uint8_t DARK_LUMA = 35;
+// 画面の平均輝度 (緑成分、0-255) が DARK_LUMA_ON 未満で暗いとみなし、DARK_LUMA_OFF 以上に戻るまで暗いままにする。
+// 1つの基準だと、その近くの明るさの部屋で暗い/明るいが数秒おきに入れ替わり、そのたびに動体検知の背景を取り直していた。
+// 実測 (写真の輝度): 夜の照明下で 45-80、消灯後や朝6時の暗い部屋で 13-29
+static const uint8_t DARK_LUMA_ON = 30;
+static const uint8_t DARK_LUMA_OFF = 40;
 
 // 動体検知はフレームを GRID_W x GRID_H のセルに間引いて比較する
 static const int GRID_W = 80;
@@ -210,10 +212,15 @@ static uint8_t frameLuma(const camera_fb_t* fb) {
 }
 
 // 明るさが変わったときだけ表示する
-static void setDark(bool now) {
+// フレームの明るさから暗いかどうかを決める (幅を持たせて切り替える)
+static void updateDark(const camera_fb_t* fb) {
+  uint8_t luma = frameLuma(fb);
+  bool now = dark ? luma < DARK_LUMA_OFF : luma < DARK_LUMA_ON;
   if (now == dark) return;
   dark = now;
-  showStatus(dark ? "too dark: not shooting" : "light: shooting resumed");
+  char msg[48];
+  snprintf(msg, sizeof(msg), dark ? "too dark (luma=%u): not shooting" : "light (luma=%u): shooting resumed", luma);
+  showStatus(msg);
 }
 
 // アップロードして、首の向きを決めるための猫スコア (Worker の aim) を返す。
@@ -279,7 +286,7 @@ static float captureAndUpload(const char* kind, float* cx, float* cy) {
     showStatus("capture failed");
     return -2.0f;
   }
-  setDark(frameLuma(Camera.fb) < DARK_LUMA);
+  updateDark(Camera.fb);
   if (dark) {
     Camera.free();
     return -3.0f;
@@ -480,7 +487,7 @@ void loop() {
     return;
   }
   // 暗いときは動体検知もしない。明るくなったら背景を取り直す
-  setDark(frameLuma(Camera.fb) < DARK_LUMA);
+  updateDark(Camera.fb);
   if (dark) {
     Camera.free();
     backgroundReady = false;
