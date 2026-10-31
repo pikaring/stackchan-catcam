@@ -230,18 +230,19 @@ export function hasPerson(object) {
 }
 
 // 猫が写っている写真だけを対象に、時系列で4等分した各区間から猫スコア最大の1枚を選ぶ。
-// 区間に人の写っていない写真があれば、その中から選ぶ (なければ人ありからも選ぶ)
-export function pickPhotos(objects, count = DIGEST_PHOTO_COUNT, threshold = CAT_SCORE_THRESHOLD) {
+// avoidPeople なら、区間に人の写っていない写真があれば、その中から選ぶ (なければ人ありからも選ぶ)
+export function pickPhotos(objects, count = DIGEST_PHOTO_COUNT, threshold = CAT_SCORE_THRESHOLD, avoidPeople = true) {
+  const person = avoidPeople ? hasPerson : () => false;
   const cats = objects
     .filter((o) => catScoreOf(o) >= threshold)
     .sort((a, b) => (a.key < b.key ? -1 : 1));
   if (cats.length <= count) {
-    const noPerson = cats.filter((o) => !hasPerson(o));
+    const noPerson = cats.filter((o) => !person(o));
     return noPerson.length > 0 ? noPerson : cats;
   }
   // 人なしを優先し、どちらも同じなら猫スコアの高い方
   const better = (a, b) => {
-    if (hasPerson(a) !== hasPerson(b)) return hasPerson(a) ? b : a;
+    if (person(a) !== person(b)) return person(a) ? b : a;
     return catScoreOf(b) > catScoreOf(a) ? b : a;
   };
   const picks = [];
@@ -265,7 +266,7 @@ function imageBox(url) {
   };
 }
 
-export function buildFlex(date, urls) {
+export function buildFlex(date, urls, title = `今日の猫 ${date}`) {
   const rows = [];
   for (let i = 0; i < urls.length; i += 2) {
     rows.push({
@@ -277,23 +278,24 @@ export function buildFlex(date, urls) {
   }
   return {
     type: "flex",
-    altText: `今日の猫（${date}）`,
+    altText: title,
     contents: {
       type: "bubble",
       size: "mega",
       header: {
         type: "box",
         layout: "vertical",
-        contents: [{ type: "text", text: `🐱 今日の猫 ${date}`, weight: "bold" }],
+        contents: [{ type: "text", text: `🐱 ${title}`, weight: "bold" }],
       },
       body: { type: "box", layout: "vertical", spacing: "sm", contents: rows },
     },
   };
 }
 
-async function lineSend(env, message) {
-  const endpoint = env.LINE_TO ? "push" : "broadcast";
-  const payload = env.LINE_TO ? { to: env.LINE_TO, messages: [message] } : { messages: [message] };
+// to が空なら友だち全員へ broadcast
+async function lineSend(env, message, to = env.LINE_TO) {
+  const endpoint = to ? "push" : "broadcast";
+  const payload = to ? { to, messages: [message] } : { messages: [message] };
   const res = await fetch(`https://api.line.me/v2/bot/message/${endpoint}`, {
     method: "POST",
     headers: {
@@ -318,6 +320,44 @@ async function sendDigest(env) {
   return { date, sent: picks.length };
 }
 
+// 6:00 と 12:00 JST に、持ち主 (LINE_OWNER_ID) だけへ途中経過の写真を送る。人が写っていてもよい。
+// 6:00 は前日 12:00 から、12:00 は当日 6:00 からの写真が対象。Mac がスリープしていても届くよう Worker から送る
+export const OWNER_REPORT_CRONS = { "0 21 * * *": 6, "0 3 * * *": 12 };
+
+export function ownerReportRange(now = new Date()) {
+  const today = jstNow(now);
+  const hour = Number(today.time.slice(0, 2));
+  if (hour < 12) {
+    const yesterday = jstNow(new Date(now.getTime() - 24 * 3600 * 1000));
+    return { title: "朝の猫", dates: [yesterday.date, today.date], fromKey: `${yesterday.date}/120000` };
+  }
+  return { title: "昼の猫", dates: [today.date], fromKey: `${today.date}/060000` };
+}
+
+async function sendOwnerReport(env, now = new Date()) {
+  if (!env.LINE_OWNER_ID) return { sent: 0, reason: "LINE_OWNER_ID is not set" };
+  const { title, dates, fromKey } = ownerReportRange(now);
+  let objects = [];
+  for (const date of dates) {
+    const listed = await env.PHOTOS.list({ prefix: `photos/${date}/`, include: ["customMetadata"] });
+    objects = objects.concat(listed.objects);
+  }
+  objects = objects.filter((o) => o.key.slice("photos/".length) >= fromKey);
+  const picks = pickPhotos(objects, DIGEST_PHOTO_COUNT, CAT_SCORE_THRESHOLD, false);
+  if (picks.length === 0) {
+    const last = objects.map((o) => o.key).sort().pop();
+    const text = last
+      ? `${title}: 猫が写った写真なし（写真 ${objects.length} 枚、最後は ${last.slice(7, 24)}）`
+      : `${title}: 写真が1枚もありません。カメラが止まっているかもしれません（電源・Wi-Fi を確認）`;
+    await lineSend(env, { type: "text", text }, env.LINE_OWNER_ID);
+    return { sent: 0, photos: objects.length };
+  }
+  const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
+  const times = picks.map((o) => `${o.key.slice(18, 20)}:${o.key.slice(20, 22)}`).join(" ");
+  await lineSend(env, buildFlex(dates.at(-1), urls, `${title} ${times}`), env.LINE_OWNER_ID);
+  return { sent: picks.length, photos: objects.length };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -329,10 +369,14 @@ export default {
       if (!authorized(request, env)) return new Response("unauthorized", { status: 401 });
       return Response.json(await sendDigest(env));
     }
+    if (request.method === "POST" && url.pathname === "/owner-report") {
+      if (!authorized(request, env)) return new Response("unauthorized", { status: 401 });
+      return Response.json(await sendOwnerReport(env));
+    }
     return new Response("not found", { status: 404 });
   },
 
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(sendDigest(env));
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(event.cron in OWNER_REPORT_CRONS ? sendOwnerReport(env) : sendDigest(env));
   },
 };

@@ -16,14 +16,17 @@ binding = "AI"
 
 # 毎日 18:05 JST (= 9:05 UTC) にその日の写真をLINEへ送る
 # StackChan の夜間停止を 18:00 開始にしたとき、最後のアップロードが届くよう5分待つ
+# 毎日 6:00 と 12:00 JST (= 21:00 / 3:00 UTC) に、持ち主 (LINE_OWNER_ID) だけへ途中経過の写真を送る
 [triggers]
-crons = ["5 9 * * *"]
+crons = ["5 9 * * *", "0 21 * * *", "0 3 * * *"]
 
 [vars]
 # デプロイ後の Worker の URL (LINE が画像を取りに来る)
 PUBLIC_BASE_URL = "https://stackchan-catcam.pikaring-0e1.workers.dev"
 # 空なら友だち全員へ broadcast。特定の人だけに送るなら LINE の userId
 LINE_TO = ""
+# 6:00 / 12:00 の途中経過を送る相手 (持ち主) の LINE userId。空なら送らない
+LINE_OWNER_ID = "U574198bd0ea4b3c501f47fdbdeb10268"
 
 # secrets (wrangler secret put):
 #   UPLOAD_TOKEN, SIGNING_SECRET, LINE_CHANNEL_ACCESS_TOKEN, ANTHROPIC_API_KEY
