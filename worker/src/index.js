@@ -6,6 +6,9 @@ const URL_LIFETIME_SEC = 30 * 24 * 3600;
 const DIGEST_PHOTO_COUNT = 4;
 const DETECTION_MODEL = "@cf/facebook/detr-resnet-50";
 const CAT_SCORE_THRESHOLD = 0.6;
+// LINE の写真選びでは、人がこのスコア以上で写っている写真を後回しにする。
+// 猫のそばに座った人が画面の大半を占める写真が、猫スコアだけで選ばれたことがあった (2026-10-31)
+const PERSON_SCORE_THRESHOLD = 0.6;
 // 首の向きを決めるための2つ目の判定 (Claude Haiku)。DETR は柵越しや影の猫を見落とすため。
 // 見間違いもあるので LINE の写真選びには使わず、首を向ける (aim) だけに使う。
 // Workers AI の LLM (Mistral / Llama 4 Scout) は猫のいない写真にも猫ありと答え、位置も当たらなかった (2026-10-27)
@@ -70,17 +73,20 @@ function authorized(request, env) {
 // 首を向けるのは AIM_HINT_SCORE 以上の猫のうち、枠がいちばん大きいもの。遠くの棚のぬいぐるみが
 // 本物の猫より高いスコアで猫と判定され、首が本物の猫から離れたことがあった (2026-10-28)。近くの本物の猫は大きく写る。
 // cx は横 (0=左端, 1=右端)、cy は縦 (0=上端, 1=下端)。猫がいなければ null。判定に失敗したら cat は -1（不明）
+// person は "person" の最高スコア (LINE の写真選びで人の写った写真を後回しにするため)
 export function bestCat(detections, width, height) {
   let best = null;
   let biggest = null;
+  let person = 0;
   for (const d of detections) {
+    if (d.label === "person") person = Math.max(person, d.score);
     if (d.label !== "cat") continue;
     if (!best || d.score > best.score) best = d;
     if (d.score >= AIM_HINT_SCORE && (!biggest || boxArea(d.box) > boxArea(biggest.box))) biggest = d;
   }
-  if (!best) return { cat: 0, cx: null, cy: null };
+  if (!best) return { cat: 0, cx: null, cy: null, person };
   const { xmin, xmax, ymin, ymax } = (biggest || best).box || {};
-  return { cat: best.score, cx: boxCenter(xmin, xmax, width), cy: boxCenter(ymin, ymax, height) };
+  return { cat: best.score, cx: boxCenter(xmin, xmax, width), cy: boxCenter(ymin, ymax, height), person };
 }
 
 function boxArea(box) {
@@ -102,7 +108,7 @@ async function detectCat(env, body, width, height) {
     return bestCat(detections, width, height);
   } catch (err) {
     console.error("cat detection failed", err);
-    return { cat: -1, cx: null, cy: null };
+    return { cat: -1, cx: null, cy: null, person: null };
   }
 }
 
@@ -173,12 +179,13 @@ async function handleUpload(request, env) {
   const head = new Uint8Array(body, 0, 2);
   if (head[0] !== 0xff || head[1] !== 0xd8) return new Response("not a jpeg", { status: 400 });
 
-  const { cat, cx, cy } = await detectCat(env, body, width, height);
+  const { cat, cx, cy, person } = await detectCat(env, body, width, height);
   // aim/aimCx/aimCy は首の向きを決めるためだけの値。cat (DETR) は LINE の写真選びに使う
   let aim = cat;
   let aimCx = cx;
   let aimCy = cy;
   const extra = {};
+  if (person !== null) extra.person = person.toFixed(3);
   if (cat >= 0 && cat < AIM_HINT_SCORE && VISION_KINDS.includes(kind)) {
     const vision = await askVision(env, body);
     if (vision.answered) extra.vision = vision.cat ? "cat" : "none";
@@ -216,18 +223,32 @@ export function catScoreOf(object) {
   return Number.isFinite(score) ? score : -1;
 }
 
-// 猫が写っている写真だけを対象に、時系列で4等分した各区間から猫スコア最大の1枚を選ぶ
+// 人が写っているか。person の記録がない写真 (2026-10-31 より前) は人なしとみなす
+export function hasPerson(object) {
+  const score = Number(object.customMetadata?.person);
+  return Number.isFinite(score) && score >= PERSON_SCORE_THRESHOLD;
+}
+
+// 猫が写っている写真だけを対象に、時系列で4等分した各区間から猫スコア最大の1枚を選ぶ。
+// 区間に人の写っていない写真があれば、その中から選ぶ (なければ人ありからも選ぶ)
 export function pickPhotos(objects, count = DIGEST_PHOTO_COUNT, threshold = CAT_SCORE_THRESHOLD) {
   const cats = objects
     .filter((o) => catScoreOf(o) >= threshold)
     .sort((a, b) => (a.key < b.key ? -1 : 1));
-  if (cats.length <= count) return cats;
+  if (cats.length <= count) {
+    const noPerson = cats.filter((o) => !hasPerson(o));
+    return noPerson.length > 0 ? noPerson : cats;
+  }
+  // 人なしを優先し、どちらも同じなら猫スコアの高い方
+  const better = (a, b) => {
+    if (hasPerson(a) !== hasPerson(b)) return hasPerson(a) ? b : a;
+    return catScoreOf(b) > catScoreOf(a) ? b : a;
+  };
   const picks = [];
   for (let i = 0; i < count; i++) {
     const from = Math.floor((i * cats.length) / count);
     const to = Math.floor(((i + 1) * cats.length) / count);
-    const best = cats.slice(from, to).reduce((a, b) => (catScoreOf(b) > catScoreOf(a) ? b : a));
-    picks.push(best);
+    picks.push(cats.slice(from, to).reduce(better));
   }
   return picks;
 }
