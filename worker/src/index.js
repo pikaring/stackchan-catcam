@@ -25,6 +25,17 @@ const VISION_PROMPT =
   "x from 0 (left edge) to 1 (right edge), y from 0 (top edge) to 1 (bottom edge). " +
   'Reply with only JSON: {"cat": false} or {"cat": true, "x": <number>, "y": <number>}.';
 
+// 18:05 の写真選びで、人が写っていないか・本当に猫が写っているかを Haiku に聞く。
+// 物体検出 (DETR) は後ろ姿や写真の端の袖・腕を人と判定できず (2026-11-01)、壁や暗い棚を猫と判定することもある。
+// 2026-11-02 に15枚で試すと、後ろ姿・端の袖・腕だけの写真と、猫と誤判定された2枚も含めて全部当たった
+const PHOTO_CHECK_PROMPT =
+  "This is a photo from a pet camera in a room. Answer two questions. " +
+  "1) Is any part of a human visible, such as a person seen from behind, hair, a back, an arm, a hand, a leg, or a foot? " +
+  "Ignore pictures of people on posters, boxes, or screens. " +
+  "2) Is a real cat clearly visible? Plush toys and pictures of cats do not count. " +
+  'Reply with only JSON: {"person": true or false, "cat": true or false}.';
+const PHOTO_CHECKS_PER_SLOT = 3; // 1区間で Haiku に聞く写真の上限 (猫スコアの高い順)
+
 const encoder = new TextEncoder();
 
 function jstNow(date = new Date()) {
@@ -137,8 +148,34 @@ export function parseVision(text) {
   }
 }
 
+// Haiku の答えから「送ってよい写真か」(人なしで猫あり) を取り出す。読めなければ null
+export function parsePhotoCheck(text) {
+  const m = typeof text === "string" ? text.match(/\{[^}]*\}/) : null;
+  if (!m) return null;
+  try {
+    const j = JSON.parse(m[0]);
+    if (typeof j.person !== "boolean" || typeof j.cat !== "boolean") return null;
+    return !j.person && j.cat;
+  } catch {
+    return null;
+  }
+}
+
 async function askVision(env, body) {
-  if (!env.ANTHROPIC_API_KEY) return { answered: false, cat: null };
+  const text = await askHaiku(env, body, VISION_PROMPT);
+  return text === null ? { answered: false, cat: null } : { answered: true, cat: parseVision(text) };
+}
+
+// R2 の写真が送ってよいもの (人なしで猫あり) かを Haiku に聞く。true / false、答えられなければ null
+async function checkPhoto(env, key) {
+  const object = await env.PHOTOS.get(key);
+  if (!object) return null;
+  return parsePhotoCheck(await askHaiku(env, await object.arrayBuffer(), PHOTO_CHECK_PROMPT));
+}
+
+// 画像と質問を Haiku に送り、答えの文字列を返す。キーがない・拒否・エラーなら null
+async function askHaiku(env, body, prompt) {
+  if (!env.ANTHROPIC_API_KEY) return null;
   const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY, timeout: VISION_TIMEOUT_MS, maxRetries: 0 });
   const data = btoa(Array.from(new Uint8Array(body), (c) => String.fromCharCode(c)).join(""));
   try {
@@ -151,18 +188,17 @@ async function askVision(env, body) {
           role: "user",
           content: [
             { type: "image", source: { type: "base64", media_type: "image/jpeg", data } },
-            { type: "text", text: VISION_PROMPT },
+            { type: "text", text: prompt },
           ],
         },
       ],
     });
-    if (msg.stop_reason === "refusal") return { answered: false, cat: null };
-    // 答えの前に説明文が付くことがあるので、parseVision が JSON の部分だけを読む
-    const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-    return { answered: true, cat: parseVision(text) };
+    if (msg.stop_reason === "refusal") return null;
+    // 答えの前に説明文が付くことがあるので、呼び出し側が JSON の部分だけを読む
+    return msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
   } catch (err) {
-    console.error("vision check failed", err instanceof Anthropic.APIError ? `${err.status} ${err.message}` : err);
-    return { answered: false, cat: null };
+    console.error("haiku check failed", err instanceof Anthropic.APIError ? `${err.status} ${err.message}` : err);
+    return null;
   }
 }
 
@@ -233,9 +269,7 @@ export function hasPerson(object) {
 // avoidPeople なら、区間に人の写っていない写真があれば、その中から選ぶ (なければ人ありからも選ぶ)
 export function pickPhotos(objects, count = DIGEST_PHOTO_COUNT, threshold = CAT_SCORE_THRESHOLD, avoidPeople = true) {
   const person = avoidPeople ? hasPerson : () => false;
-  const cats = objects
-    .filter((o) => catScoreOf(o) >= threshold)
-    .sort((a, b) => (a.key < b.key ? -1 : 1));
+  const cats = catPhotos(objects, threshold);
   if (cats.length <= count) {
     const noPerson = cats.filter((o) => !person(o));
     return noPerson.length > 0 ? noPerson : cats;
@@ -252,6 +286,46 @@ export function pickPhotos(objects, count = DIGEST_PHOTO_COUNT, threshold = CAT_
     picks.push(cats.slice(from, to).reduce(better));
   }
   return picks;
+}
+
+function catPhotos(objects, threshold = CAT_SCORE_THRESHOLD) {
+  return objects.filter((o) => catScoreOf(o) >= threshold).sort((a, b) => (a.key < b.key ? -1 : 1));
+}
+
+// 18:05 の写真選び。pickPhotos と同じ区間ごとに、猫スコアの高い順に Haiku に確かめ、
+// 最初に「人なしで猫あり」と答えた写真を選ぶ。聞いた写真がどれも駄目な区間は飛ばす (送る枚数が減る)。
+// どの区間も選べないとき、または Haiku が答えられないときは pickPhotos の結果を使う。
+// check は (key) => true (送ってよい) / false / null (答えられない)。テストで差し替えられるよう引数にしている
+export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COUNT) {
+  const fallback = pickPhotos(objects, count);
+  const cats = catPhotos(objects);
+  const slots = [];
+  if (cats.length <= count) {
+    for (const o of cats) slots.push([o]);
+  } else {
+    for (let i = 0; i < count; i++) {
+      slots.push(cats.slice(Math.floor((i * cats.length) / count), Math.floor(((i + 1) * cats.length) / count)));
+    }
+  }
+  const picks = [];
+  for (const slot of slots) {
+    const candidates = slot
+      .filter((o) => !hasPerson(o))
+      .sort((a, b) => catScoreOf(b) - catScoreOf(a))
+      .slice(0, PHOTO_CHECKS_PER_SLOT);
+    let chosen = null;
+    for (const o of candidates) {
+      const ok = await check(o.key);
+      if (ok === null) return fallback; // Haiku が答えられないときは物体検出の結果だけで選ぶ
+      if (ok) {
+        chosen = o;
+        break;
+      }
+    }
+    picks.push(chosen);
+  }
+  const kept = picks.filter((o) => o);
+  return kept.length > 0 ? kept : fallback;
 }
 
 function imageBox(url) {
@@ -310,7 +384,7 @@ async function lineSend(env, message, to = env.LINE_TO) {
 async function sendDigest(env) {
   const { date } = jstNow();
   const listed = await env.PHOTOS.list({ prefix: `photos/${date}/`, include: ["customMetadata"] });
-  const picks = pickPhotos(listed.objects);
+  const picks = await pickCheckedPhotos(listed.objects, (key) => checkPhoto(env, key));
   if (picks.length === 0) {
     await lineSend(env, { type: "text", text: `${date} は猫が写った写真がありませんでした。` });
     return { date, sent: 0 };
