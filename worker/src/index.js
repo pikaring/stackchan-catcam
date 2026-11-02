@@ -148,14 +148,14 @@ export function parseVision(text) {
   }
 }
 
-// Haiku の答えから「送ってよい写真か」(人なしで猫あり) を取り出す。読めなければ null
-export function parsePhotoCheck(text) {
+// Haiku の答えから「送ってよい写真か」(猫あり、avoidPeople なら人なしも) を取り出す。読めなければ null
+export function parsePhotoCheck(text, avoidPeople = true) {
   const m = typeof text === "string" ? text.match(/\{[^}]*\}/) : null;
   if (!m) return null;
   try {
     const j = JSON.parse(m[0]);
     if (typeof j.person !== "boolean" || typeof j.cat !== "boolean") return null;
-    return !j.person && j.cat;
+    return avoidPeople ? !j.person && j.cat : j.cat;
   } catch {
     return null;
   }
@@ -166,11 +166,11 @@ async function askVision(env, body) {
   return text === null ? { answered: false, cat: null } : { answered: true, cat: parseVision(text) };
 }
 
-// R2 の写真が送ってよいもの (人なしで猫あり) かを Haiku に聞く。true / false、答えられなければ null
-async function checkPhoto(env, key) {
+// R2 の写真が送ってよいもの (猫あり、avoidPeople なら人なしも) かを Haiku に聞く。true / false、答えられなければ null
+async function checkPhoto(env, key, avoidPeople = true) {
   const object = await env.PHOTOS.get(key);
   if (!object) return null;
-  return parsePhotoCheck(await askHaiku(env, await object.arrayBuffer(), PHOTO_CHECK_PROMPT));
+  return parsePhotoCheck(await askHaiku(env, await object.arrayBuffer(), PHOTO_CHECK_PROMPT), avoidPeople);
 }
 
 // 画像と質問を Haiku に送り、答えの文字列を返す。キーがない・拒否・エラーなら null
@@ -296,8 +296,8 @@ function catPhotos(objects, threshold = CAT_SCORE_THRESHOLD) {
 // 最初に「人なしで猫あり」と答えた写真を選ぶ。聞いた写真がどれも駄目な区間は飛ばす (送る枚数が減る)。
 // どの区間も選べないとき、または Haiku が答えられないときは pickPhotos の結果を使う。
 // check は (key) => true (送ってよい) / false / null (答えられない)。テストで差し替えられるよう引数にしている
-export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COUNT) {
-  const fallback = pickPhotos(objects, count);
+export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COUNT, avoidPeople = true) {
+  const fallback = pickPhotos(objects, count, CAT_SCORE_THRESHOLD, avoidPeople);
   const cats = catPhotos(objects);
   const slots = [];
   if (cats.length <= count) {
@@ -310,7 +310,7 @@ export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COU
   const picks = [];
   for (const slot of slots) {
     const candidates = slot
-      .filter((o) => !hasPerson(o))
+      .filter((o) => !avoidPeople || !hasPerson(o))
       .sort((a, b) => catScoreOf(b) - catScoreOf(a))
       .slice(0, PHOTO_CHECKS_PER_SLOT);
     let chosen = null;
@@ -417,7 +417,7 @@ async function sendOwnerReport(env, now = new Date()) {
     objects = objects.concat(listed.objects);
   }
   objects = objects.filter((o) => o.key.slice("photos/".length) >= fromKey);
-  const picks = pickPhotos(objects, DIGEST_PHOTO_COUNT, CAT_SCORE_THRESHOLD, false);
+  const picks = await pickCheckedPhotos(objects, (key) => checkPhoto(env, key, false), DIGEST_PHOTO_COUNT, false);
   if (picks.length === 0) {
     const last = objects.map((o) => o.key).sort().pop();
     const text = last
