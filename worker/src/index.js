@@ -384,7 +384,11 @@ async function lineSend(env, message, to = env.LINE_TO) {
 async function sendDigest(env) {
   const { date } = jstNow();
   const listed = await env.PHOTOS.list({ prefix: `photos/${date}/`, include: ["customMetadata"] });
-  const picks = await pickCheckedPhotos(listed.objects, (key) => checkPhoto(env, key));
+  const check = (key) => checkPhoto(env, key);
+  // 6:00・12:00 に持ち主へ送った写真は外す。外して1枚も残らなければ、外さずに選ぶ
+  const sent = await readSent(env, date);
+  let picks = await pickCheckedPhotos(listed.objects.filter((o) => !sent.has(o.key)), check);
+  if (picks.length === 0 && sent.size > 0) picks = await pickCheckedPhotos(listed.objects, check);
   if (picks.length === 0) {
     await lineSend(env, { type: "text", text: `${date} は猫が写った写真がありませんでした。` });
     return { date, sent: 0 };
@@ -392,6 +396,23 @@ async function sendDigest(env) {
   const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
   await lineSend(env, buildFlex(date, urls));
   return { date, sent: picks.length };
+}
+
+// 持ち主へ送った写真の key を、日付ごとに R2 の sent/<日付>.json に残す (18:05 の4枚選びで外すため)
+async function readSent(env, date) {
+  const object = await env.PHOTOS.get(`sent/${date}.json`);
+  if (!object) return new Set();
+  try {
+    return new Set(await object.json());
+  } catch {
+    return new Set();
+  }
+}
+
+async function addSent(env, date, keys) {
+  const sent = await readSent(env, date);
+  for (const key of keys) sent.add(key);
+  await env.PHOTOS.put(`sent/${date}.json`, JSON.stringify([...sent]));
 }
 
 // 6:00 と 12:00 JST に、持ち主 (LINE_OWNER_ID) だけへ途中経過の写真を送る。人が写っていてもよい。
@@ -429,6 +450,7 @@ async function sendOwnerReport(env, now = new Date()) {
   const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
   const times = picks.map((o) => `${o.key.slice(18, 20)}:${o.key.slice(20, 22)}`).join(" ");
   await lineSend(env, buildFlex(dates.at(-1), urls, `${title} ${times}`), env.LINE_OWNER_ID);
+  await addSent(env, dates.at(-1), picks.map((o) => o.key));
   return { sent: picks.length, photos: objects.length };
 }
 
