@@ -1,6 +1,6 @@
 // Stack-chan (M5Stack CoreS3) 猫見守りカメラ
-// 1時間に1回、または動体検知で撮影して Worker にアップロードする。
-// 1時間ごとの撮影では猫を探す: 写っていなければ首の向きを変えて撮り、
+// 30分に1回、または動体検知で撮影して Worker にアップロードする。
+// 30分ごとの撮影では猫を探す: 写っていなければ首の向きを変えて撮り、
 // 猫が少しでも写っていればその方向に首を回して、猫を写真の中央に合わせてもう1枚撮る。
 // 夜間 (JST 0:00-6:00) と、起動後に時刻が取れるまでは撮影も首振りもしない。
 #include <M5StackChan.h>
@@ -15,7 +15,7 @@
 #include "secrets.h"
 
 // ---- 調整用パラメータ ----
-static const uint32_t HOURLY_INTERVAL_MS = 60UL * 60UL * 1000UL;
+static const uint32_t ROUND_INTERVAL_MS = 30UL * 60UL * 1000UL;  // 定時撮影の間隔。冬は暗くなるのが早いので 30 分 (kind は Worker に合わせて hourly のまま)
 static const uint32_t MOTION_COOLDOWN_MS = 60UL * 1000UL;  // 動体検知の連続撮影を抑える
 static const uint16_t MAX_MOTION_SHOTS_PER_DAY = 150;      // 猫が動き続けても上限で止める
 static const uint8_t JPEG_QUALITY = 12;                    // 小さいほど高画質 (10-63)
@@ -470,7 +470,7 @@ void loop() {
     return;
   }
 
-  if (now - lastHourlyMs >= HOURLY_INTERVAL_MS) {
+  if (now - lastHourlyMs >= ROUND_INTERVAL_MS) {
     lastHourlyMs = now;
     hourlyRound();
     return;
