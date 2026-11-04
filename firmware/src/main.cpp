@@ -6,6 +6,7 @@
 #include <M5StackChan.h>
 #include <time.h>
 #include <esp_system.h>
+#include <esp_sntp.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -127,6 +128,27 @@ static bool ensureWifi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
+// SNTP で時刻を合わせたら立てる。起動時は M5.begin() が時計チップ (RTC) の時刻を写すので、
+// 年だけ見ると NTP の前に「時刻が取れた」になる (時計チップが 20 分進んでいて、起動直後の時刻がずれた。2026-11-04)
+static volatile bool timeSynced = false;
+static volatile bool rtcNeedsWrite = false;  // SNTP のコールバックは別タスクなので、時計チップへの書き込みは loop() でする
+
+static void onTimeSync(struct timeval*) {
+  timeSynced = true;
+  rtcNeedsWrite = true;
+}
+
+// 合わせた時刻を時計チップにも書く (M5Unified は時計チップを UTC として読む)。次の起動がこの時刻から始まる
+static void writeRtcIfSynced() {
+  if (!rtcNeedsWrite) return;
+  rtcNeedsWrite = false;
+  time_t now = time(nullptr);
+  struct tm utc;
+  gmtime_r(&now, &utc);
+  M5.Rtc.setDateTime(&utc);
+  showStatus("rtc updated from ntp");
+}
+
 // 時刻がまだ取れていなければ true (夜中の再起動で撮らないよう、時刻が分かるまで止まる)
 // 今の時刻 (JST) を読む。まだ NTP で合わせていなければ false。
 // getLocalTime(&t, 0) は呼んだ瞬間に millis() が進むと一度も時刻を読まずに false を返すので使わない
@@ -134,7 +156,7 @@ static bool ensureWifi() {
 static bool readLocalTime(struct tm* t) {
   time_t now = time(nullptr);
   localtime_r(&now, t);
-  return t->tm_year > (2016 - 1900);
+  return timeSynced && t->tm_year > (2016 - 1900);
 }
 
 static bool isQuietHours() {
@@ -410,11 +432,24 @@ void setup() {
   bootInfo += wifiOk ? "&wifi=ok" : "&wifi=fail";
 
   // 夜間停止の判定に JST の時刻を使う。Wi-Fi が後から繋がれば SNTP がその時に合わせる
+  sntp_set_time_sync_notification_cb(onTimeSync);
   configTzTime("JST-9", "ntp.nict.jp", "pool.ntp.org");
+  {
+    time_t rtcNow = time(nullptr);  // NTP の前は M5.begin() が写した時計チップの時刻
+    struct tm rtcLocal;
+    localtime_r(&rtcNow, &rtcLocal);
+    char msg[40];
+    strftime(msg, sizeof(msg), "rtc time %H:%M:%S JST", &rtcLocal);
+    showStatus(msg);
+  }
   struct tm t;
-  if (wifiOk && getLocalTime(&t, 10000)) {
+  bool synced = false;
+  for (uint32_t start = millis(); wifiOk && millis() - start < 10000; delay(100)) {
+    if ((synced = readLocalTime(&t))) break;
+  }
+  if (synced) {
     char msg[32];
-    strftime(msg, sizeof(msg), "time %H:%M JST", &t);
+    strftime(msg, sizeof(msg), "ntp time %H:%M:%S JST", &t);
     showStatus(msg);
   } else {
     showStatus("time sync failed (wait before shooting)");
@@ -433,6 +468,7 @@ void setup() {
 
 void loop() {
   M5StackChan.update();
+  writeRtcIfSynced();
   uint32_t now = millis();
 
   // 起動後しばらくしたら画面を暗くする (猫が気にしないように・省電力)。
