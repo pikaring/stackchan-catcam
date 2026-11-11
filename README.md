@@ -58,7 +58,7 @@ Stack-chan --HTTPS POST--> Cloudflare Worker --> R2 (写真保存)
 - 持ち主への途中経過: 毎日 6:00 と 12:00 JST に、`LINE_OWNER_ID`（`wrangler.toml`）の人だけへ push で送る。
   6:00 は前日 12:00 から、12:00 は当日 6:00 からの写真が対象で、選び方は4枚選びと同じだが人が写っていても選ぶ。
   Haiku の確認も同じく使い、本物の猫が写っていない写真（物体検出が扉や壁を猫と誤った写真）は外す。
-  送った写真の key は R2 の `sent/<日付>.json` に残し、18:05 の4枚選びではそれを外す（外して1枚も残らなければ外さずに選ぶ）。
+  持ち主への送信は確認用なので、18:05 の4枚選びでは持ち主へ送った写真も外さない（2026-11-11 から。それまでは外していた）。
   猫の写真がなければ枚数と最後の写真の時刻を、1枚もなければカメラが止まっている可能性を文字で送る。
   1日2通（月60通ほど）なので、家族への送信と合わせても無料枠（月200通）に収まる。
   時刻を待たずに試すには `curl -X POST -H "Authorization: Bearer $UPLOAD_TOKEN" https://<worker-url>/owner-report`。
@@ -102,6 +102,8 @@ LINE Notify は終了しているので Messaging API を使う。
 ```sh
 curl -X POST -H "Authorization: Bearer $UPLOAD_TOKEN" https://<worker-url>/digest
 ```
+
+持ち主（`LINE_OWNER_ID`）にだけ送って確かめるときは `/digest?owner=1`。
 
 ## 3. ファームウェア
 

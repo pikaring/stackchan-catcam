@@ -448,38 +448,19 @@ async function lineSend(env, message, to = env.LINE_TO) {
   if (!res.ok) throw new Error(`LINE ${endpoint} failed: ${res.status} ${await res.text()}`);
 }
 
-async function sendDigest(env) {
+// to を渡すとその人だけへ送る (確認用。POST /digest?owner=1 で持ち主へ)
+async function sendDigest(env, to = env.LINE_TO) {
   const { date } = jstNow();
   const listed = await env.PHOTOS.list({ prefix: `photos/${date}/`, include: ["customMetadata"] });
-  const rate = (key) => ratePhoto(env, key);
-  // 6:00・12:00 に持ち主へ送った写真は外す。外して1枚も残らなければ、外さずに選ぶ
-  const sent = await readSent(env, date);
-  let picks = await pickBestPhotos(listed.objects.filter((o) => !sent.has(o.key)), rate);
-  if (picks.length === 0 && sent.size > 0) picks = await pickBestPhotos(listed.objects, rate);
+  // 6:00・12:00 に持ち主へ送った写真も含め、その日の全部から選ぶ。持ち主への送信は確認用で、18:05 は全員へ送るため (2026-11-11)
+  const picks = await pickBestPhotos(listed.objects, (key) => ratePhoto(env, key));
   if (picks.length === 0) {
-    await lineSend(env, { type: "text", text: `${date} は猫が写った写真がありませんでした。` });
+    await lineSend(env, { type: "text", text: `${date} は猫が写った写真がありませんでした。` }, to);
     return { date, sent: 0 };
   }
   const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
-  await lineSend(env, buildFlex(date, urls));
+  await lineSend(env, buildFlex(date, urls), to);
   return { date, sent: picks.length };
-}
-
-// 持ち主へ送った写真の key を、日付ごとに R2 の sent/<日付>.json に残す (18:05 の4枚選びで外すため)
-async function readSent(env, date) {
-  const object = await env.PHOTOS.get(`sent/${date}.json`);
-  if (!object) return new Set();
-  try {
-    return new Set(await object.json());
-  } catch {
-    return new Set();
-  }
-}
-
-async function addSent(env, date, keys) {
-  const sent = await readSent(env, date);
-  for (const key of keys) sent.add(key);
-  await env.PHOTOS.put(`sent/${date}.json`, JSON.stringify([...sent]));
 }
 
 // 6:00 と 12:00 JST に、持ち主 (LINE_OWNER_ID) だけへ途中経過の写真を送る。人が写っていてもよい。
@@ -517,7 +498,6 @@ async function sendOwnerReport(env, now = new Date()) {
   const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
   const times = picks.map((o) => `${o.key.slice(18, 20)}:${o.key.slice(20, 22)}`).join(" ");
   await lineSend(env, buildFlex(dates.at(-1), urls, `${title} ${times}`), env.LINE_OWNER_ID);
-  await addSent(env, dates.at(-1), picks.map((o) => o.key));
   return { sent: picks.length, photos: objects.length };
 }
 
@@ -530,7 +510,8 @@ export default {
     }
     if (request.method === "POST" && url.pathname === "/digest") {
       if (!authorized(request, env)) return new Response("unauthorized", { status: 401 });
-      return Response.json(await sendDigest(env));
+      if (url.searchParams.get("owner") === "1" && !env.LINE_OWNER_ID) return new Response("LINE_OWNER_ID is not set", { status: 400 });
+      return Response.json(await sendDigest(env, url.searchParams.get("owner") === "1" ? env.LINE_OWNER_ID : env.LINE_TO));
     }
     if (request.method === "POST" && url.pathname === "/owner-report") {
       if (!authorized(request, env)) return new Response("unauthorized", { status: 401 });
