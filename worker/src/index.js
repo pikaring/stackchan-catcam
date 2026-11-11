@@ -35,6 +35,20 @@ const PHOTO_CHECK_PROMPT =
   "2) Is a real cat clearly visible? Plush toys and pictures of cats do not count. " +
   'Reply with only JSON: {"person": true or false, "cat": true or false}.';
 const PHOTO_CHECKS_PER_SLOT = 3; // 1区間で Haiku に聞く写真の上限 (猫スコアの高い順)
+// 18:05 は区間に分けず、その日いちばんよく撮れた写真を送る (2026-11-11 ユーザー判断)。
+// PHOTO_CHECK_PROMPT の2問に、写りの点 (1〜10) を足して Haiku に聞く
+const PHOTO_RATE_PROMPT =
+  "This is a photo from a pet camera in a room. Answer three questions. " +
+  "1) Is any part of a human visible, such as a person seen from behind, hair, a back, an arm, a hand, a leg, or a foot? " +
+  "Ignore pictures of people on posters, boxes, or screens. " +
+  "2) Is a real cat clearly visible? Plush toys and pictures of cats do not count. " +
+  "3) How good is this as a photo of the cat, as an integer from 1 (poor) to 10 (excellent)? " +
+  "Rate higher when the cat is large in the frame, its face and eyes are visible, it is sharp, and it is well lit. " +
+  "Rate lower when it is blurry, dark, far away, cut off at the edge, or mostly hidden behind cage bars. " +
+  'Reply with only JSON: {"person": true or false, "cat": true or false, "quality": <integer>}.';
+const RATE_CANDIDATES = 12;          // Haiku に点を付けさせる写真の上限 (猫スコアの高い順)
+const RATE_CANDIDATES_PER_HOUR = 2;  // 探す・寄せるで続けて撮った似た写真ばかりが候補にならないよう、1時間ごとの上限
+const DIGEST_MIN_GAP_MIN = 60;       // 送る写真どうしをこの分数以上離す (似た写真が並ばないように)
 
 const encoder = new TextEncoder();
 
@@ -161,6 +175,15 @@ export function parsePhotoCheck(text, avoidPeople = true) {
   }
 }
 
+// Haiku の写りの採点から { ok: 送ってよいか, quality: 1〜10 } を取り出す。読めなければ null
+export function parsePhotoRating(text, avoidPeople = true) {
+  const ok = parsePhotoCheck(text, avoidPeople);
+  if (ok === null) return null;
+  const quality = Number(JSON.parse(text.match(/\{[^}]*\}/)[0]).quality);
+  if (!Number.isFinite(quality) || quality < 1 || quality > 10) return null;
+  return { ok, quality };
+}
+
 async function askVision(env, body) {
   const text = await askHaiku(env, body, VISION_PROMPT);
   return text === null ? { answered: false, cat: null } : { answered: true, cat: parseVision(text) };
@@ -171,6 +194,13 @@ async function checkPhoto(env, key, avoidPeople = true) {
   const object = await env.PHOTOS.get(key);
   if (!object) return null;
   return parsePhotoCheck(await askHaiku(env, await object.arrayBuffer(), PHOTO_CHECK_PROMPT), avoidPeople);
+}
+
+// R2 の写真を Haiku に採点させる。{ ok, quality }、答えられなければ null
+async function ratePhoto(env, key, avoidPeople = true) {
+  const object = await env.PHOTOS.get(key);
+  if (!object) return null;
+  return parsePhotoRating(await askHaiku(env, await object.arrayBuffer(), PHOTO_RATE_PROMPT), avoidPeople);
 }
 
 // 画像と質問を Haiku に送り、答えの文字列を返す。キーがない・拒否・エラーなら null
@@ -328,6 +358,43 @@ export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COU
   return kept.length > 0 ? kept : fallback;
 }
 
+// key (photos/<日付>/HHMMSS-<kind>.jpg) の撮った時刻を、0時からの分で返す
+function minuteOf(key) {
+  return Number(key.slice(18, 20)) * 60 + Number(key.slice(20, 22));
+}
+
+// 18:05 の写真選び。猫スコアの高い写真 (1時間に2枚まで、合わせて12枚まで) を Haiku に採点させ、
+// 「人なしで猫あり」の中から点の高い順に、すでに選んだ写真と1時間以上離れたものを count 枚まで選ぶ。
+// 送るときは時間順に並べる。どれも選べないとき、または Haiku が答えられないときは pickPhotos の結果を使う。
+// rate は (key) => { ok, quality } / null (答えられない)。テストで差し替えられるよう引数にしている
+export async function pickBestPhotos(objects, rate, count = DIGEST_PHOTO_COUNT, avoidPeople = true) {
+  const fallback = pickPhotos(objects, count, CAT_SCORE_THRESHOLD, avoidPeople);
+  const perHour = new Map();
+  const candidates = [];
+  for (const o of catPhotos(objects)
+    .filter((o) => !avoidPeople || !hasPerson(o))
+    .sort((a, b) => catScoreOf(b) - catScoreOf(a))) {
+    const hour = o.key.slice(18, 20);
+    if ((perHour.get(hour) ?? 0) >= RATE_CANDIDATES_PER_HOUR) continue;
+    perHour.set(hour, (perHour.get(hour) ?? 0) + 1);
+    candidates.push(o);
+    if (candidates.length >= RATE_CANDIDATES) break;
+  }
+  const ratings = await Promise.all(candidates.map((o) => rate(o.key)));
+  if (ratings.some((r) => r === null)) return fallback; // Haiku が答えられないときは物体検出の結果だけで選ぶ
+  const ranked = candidates
+    .map((o, i) => ({ o, ...ratings[i] }))
+    .filter((c) => c.ok)
+    .sort((a, b) => b.quality - a.quality || catScoreOf(b.o) - catScoreOf(a.o));
+  const picks = [];
+  for (const { o } of ranked) {
+    if (picks.length >= count) break;
+    if (picks.every((p) => Math.abs(minuteOf(p.key) - minuteOf(o.key)) >= DIGEST_MIN_GAP_MIN)) picks.push(o);
+  }
+  picks.sort((a, b) => (a.key < b.key ? -1 : 1));
+  return picks.length > 0 ? picks : fallback;
+}
+
 function imageBox(url) {
   return {
     type: "image",
@@ -384,11 +451,11 @@ async function lineSend(env, message, to = env.LINE_TO) {
 async function sendDigest(env) {
   const { date } = jstNow();
   const listed = await env.PHOTOS.list({ prefix: `photos/${date}/`, include: ["customMetadata"] });
-  const check = (key) => checkPhoto(env, key);
+  const rate = (key) => ratePhoto(env, key);
   // 6:00・12:00 に持ち主へ送った写真は外す。外して1枚も残らなければ、外さずに選ぶ
   const sent = await readSent(env, date);
-  let picks = await pickCheckedPhotos(listed.objects.filter((o) => !sent.has(o.key)), check);
-  if (picks.length === 0 && sent.size > 0) picks = await pickCheckedPhotos(listed.objects, check);
+  let picks = await pickBestPhotos(listed.objects.filter((o) => !sent.has(o.key)), rate);
+  if (picks.length === 0 && sent.size > 0) picks = await pickBestPhotos(listed.objects, rate);
   if (picks.length === 0) {
     await lineSend(env, { type: "text", text: `${date} は猫が写った写真がありませんでした。` });
     return { date, sent: 0 };
