@@ -358,12 +358,12 @@ export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COU
   return kept.length > 0 ? kept : fallback;
 }
 
-// key (photos/<日付>/HHMMSS-<kind>.jpg) の撮った時刻を、0時からの分で返す
+// key (photos/<日付>/HHMMSS-<kind>.jpg) の撮った時刻を分で返す。18:05 は前日分もまたぐので日付も含める
 function minuteOf(key) {
-  return Number(key.slice(18, 20)) * 60 + Number(key.slice(20, 22));
+  return Date.parse(key.slice(7, 17)) / 60000 + Number(key.slice(18, 20)) * 60 + Number(key.slice(20, 22));
 }
 
-// 18:05 の写真選び。猫スコアの高い写真 (1時間に2枚まで、合わせて12枚まで) を Haiku に採点させ、
+// 18:05 の写真選び (digestRange の24時間分)。猫スコアの高い写真 (1時間に2枚まで、合わせて12枚まで) を Haiku に採点させ、
 // 「人なしで猫あり」の中から点の高い順に、すでに選んだ写真と1時間以上離れたものを count 枚まで選ぶ。
 // 送るときは時間順に並べる。どれも選べないとき、または Haiku が答えられないときは pickPhotos の結果を使う。
 // rate は (key) => { ok, quality } / null (答えられない)。テストで差し替えられるよう引数にしている
@@ -374,7 +374,7 @@ export async function pickBestPhotos(objects, rate, count = DIGEST_PHOTO_COUNT, 
   for (const o of catPhotos(objects)
     .filter((o) => !avoidPeople || !hasPerson(o))
     .sort((a, b) => catScoreOf(b) - catScoreOf(a))) {
-    const hour = o.key.slice(18, 20);
+    const hour = o.key.slice(7, 20); // 日付/時
     if ((perHour.get(hour) ?? 0) >= RATE_CANDIDATES_PER_HOUR) continue;
     perHour.set(hour, (perHour.get(hour) ?? 0) + 1);
     candidates.push(o);
@@ -449,11 +449,23 @@ async function lineSend(env, message, to = env.LINE_TO) {
 }
 
 // to を渡すとその人だけへ送る (確認用。POST /digest?owner=1 で持ち主へ)
+// 18:05 の対象は前日 18:05 から。当日だけだと、猫のよく写る夕方〜夜 (18:05 以降) の写真がどの日にも入らなかった (2026-11-17)
+export function digestRange(now = new Date()) {
+  const today = jstNow(now);
+  const yesterday = jstNow(new Date(now.getTime() - 24 * 3600 * 1000));
+  return { date: today.date, dates: [yesterday.date, today.date], fromKey: `${yesterday.date}/180500` };
+}
+
 async function sendDigest(env, to = env.LINE_TO) {
-  const { date } = jstNow();
-  const listed = await env.PHOTOS.list({ prefix: `photos/${date}/`, include: ["customMetadata"] });
-  // 6:00・12:00 に持ち主へ送った写真も含め、その日の全部から選ぶ。持ち主への送信は確認用で、18:05 は全員へ送るため (2026-11-11)
-  const picks = await pickBestPhotos(listed.objects, (key) => ratePhoto(env, key));
+  const { date, dates, fromKey } = digestRange();
+  let objects = [];
+  for (const d of dates) {
+    const listed = await env.PHOTOS.list({ prefix: `photos/${d}/`, include: ["customMetadata"] });
+    objects = objects.concat(listed.objects);
+  }
+  objects = objects.filter((o) => o.key.slice("photos/".length) >= fromKey);
+  // 6:00・12:00 に持ち主へ送った写真も含め、全部から選ぶ。持ち主への送信は確認用で、18:05 は全員へ送るため (2026-11-11)
+  const picks = await pickBestPhotos(objects, (key) => ratePhoto(env, key));
   if (picks.length === 0) {
     await lineSend(env, { type: "text", text: `${date} は猫が写った写真がありませんでした。` }, to);
     return { date, sent: 0 };
