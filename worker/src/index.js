@@ -465,7 +465,8 @@ async function sendDigest(env, to = env.LINE_TO) {
   }
   objects = objects.filter((o) => o.key.slice("photos/".length) >= fromKey);
   // 6:00・12:00 に持ち主へ送った写真も含め、全部から選ぶ。持ち主への送信は確認用で、18:05 は全員へ送るため (2026-11-11)
-  const picks = await pickBestPhotos(objects, (key) => ratePhoto(env, key));
+  // 人が写っていても選ぶ (avoidPeople = false)。人を避けるのをやめた (2026-11-25)
+  const picks = await pickBestPhotos(objects, (key) => ratePhoto(env, key, false), DIGEST_PHOTO_COUNT, false);
   if (picks.length === 0) {
     await lineSend(env, { type: "text", text: `${date} は猫が写った写真がありませんでした。` }, to);
     return { date, sent: 0 };
