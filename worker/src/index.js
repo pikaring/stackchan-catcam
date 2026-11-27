@@ -47,12 +47,15 @@ const PHOTO_RATE_PROMPT =
   "Rate lower when it is blurry, dark, far away, cut off at the edge, or mostly hidden behind cage bars. " +
   "4) Estimate the cat's mood from its face, posture, and movement as probabilities from 0 to 1 that sum to 1: " +
   "relaxed, alert, scared, aggressive. " +
-  "5) What is the cat doing? Choose one of: sleeping, resting, grooming, walking, eating, playing, looking_out, other, unknown. " +
+  "5) What is the cat doing in this scene? Look at what is around it: people, a sofa, a litter box, food, a window, the cage, a cat tower. " +
+  "Answer in Japanese with one short line of at most 20 characters, written as the cat speaking in the first person and ending in ニャ. " +
+  "Examples: 人に甘えているニャ, ソファーから降りるニャ, 歩いているニャ, トイレに入るニャ, ごはんを食べているニャ, ケージの上で丸くなっているニャ. " +
+  "Describe only what you can actually see; do not guess. If you cannot tell what the cat is doing, answer an empty string. " +
   "6) If the mood is hard to judge from this photo, why? Choose one of: none, dark, blurry, far, hidden, cut_off, angle " +
   "(dark = poor light, hidden = behind cage bars or objects, cut_off = cut off at the edge, angle = face or body not visible). " +
   'Reply with only flat JSON: {"person": true or false, "cat": true or false, "quality": <integer>, ' +
   '"relaxed": <number>, "alert": <number>, "scared": <number>, "aggressive": <number>, ' +
-  '"activity": "<one word from question 5>", "reason": "<one word from question 6>"}.';
+  '"situation": "<answer to question 5>", "reason": "<one word from question 6>"}.';
 // 気分の推定 (MiaoSense の4分類にならう)。写真から Claude Haiku が見た目で推定する目安で、診断ではない
 // say は猫 (モモ) のセリフ
 export const CAT_NAME = "モモ";
@@ -66,17 +69,7 @@ const UNCLEAR_SAY = "今の気分は、よくわからないニャ";
 // 気分を出すのは、いちばん高い気分の確からしさ (%) がこれを超えたときだけ。60%以下なら気分は出さず、
 // 何をしているか・わからない理由を出す。ほぼ同じ写真で気分が食い違ったため (2026-11-27)
 const MOOD_MIN_PERCENT = 60;
-// 気分がわからないときに出す、何をしているか (写真から見て取れること)
-const ACTIVITIES = {
-  sleeping: "寝ているニャ",
-  resting: "のんびりしているニャ",
-  grooming: "毛づくろい中ニャ",
-  walking: "歩いているニャ",
-  eating: "ごはん中ニャ",
-  playing: "遊んでいるニャ",
-  looking_out: "外を見ているニャ",
-};
-// 何をしているかもわからないときに出す、わからない理由
+// 何をしているかもわからないときに出す、わからない理由 (situation が空のとき)
 const REASONS = {
   dark: "暗くてよく見えないニャ",
   blurry: "ぶれちゃったニャ",
@@ -229,6 +222,15 @@ export function parseMood(j) {
   return Math.round(confidence * 100) > MOOD_MIN_PERCENT ? { mood, confidence } : { mood: null, confidence };
 }
 
+// 何をしているか (モモのセリフ)。短い一文だけ受け取る。空・長すぎる・カギ括弧や改行を含むものは null
+const MAX_SITUATION_LENGTH = 30;
+export function parseSituation(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (text === "" || text.length > MAX_SITUATION_LENGTH || /[「」\n\r<>]/.test(text)) return null;
+  return text;
+}
+
 // Haiku の写りの採点から { ok: 送ってよいか, quality: 1〜10, mood, confidence } を取り出す。読めなければ null
 // 気分だけ読めなくても写真選びは止めない (mood は null = 不明瞭)
 export function parsePhotoRating(text, avoidPeople = true) {
@@ -237,7 +239,7 @@ export function parsePhotoRating(text, avoidPeople = true) {
   const j = JSON.parse(text.match(/\{[^}]*\}/)[0]);
   const quality = Number(j.quality);
   if (!Number.isFinite(quality) || quality < 1 || quality > 10) return null;
-  return { ok, quality, ...parseMood(j), activity: ACTIVITIES[j.activity] ? j.activity : null, reason: REASONS[j.reason] ? j.reason : null };
+  return { ok, quality, ...parseMood(j), situation: parseSituation(j.situation), reason: REASONS[j.reason] ? j.reason : null };
 }
 
 async function askVision(env, body) {
@@ -455,7 +457,7 @@ export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COU
       const ok = typeof result === "object" ? result.ok : result;
       if (ok) {
         if (typeof result === "object") {
-          o.moodResult = { mood: result.mood, confidence: result.confidence, activity: result.activity, reason: result.reason };
+          o.moodResult = { mood: result.mood, confidence: result.confidence, situation: result.situation, reason: result.reason };
         }
         chosen = o;
         break;
@@ -496,10 +498,10 @@ export async function pickBestPhotos(objects, rate, count = DIGEST_PHOTO_COUNT, 
     .filter((c) => c.ok)
     .sort((a, b) => b.quality - a.quality || catScoreOf(b.o) - catScoreOf(a.o));
   const picks = [];
-  for (const { o, mood, confidence, activity, reason } of ranked) {
+  for (const { o, mood, confidence, situation, reason } of ranked) {
     if (picks.length >= count) break;
     if (picks.every((p) => Math.abs(minuteOf(p.key) - minuteOf(o.key)) >= DIGEST_MIN_GAP_MIN)) {
-      o.moodResult = { mood, confidence, activity, reason }; // LINE の写真に添える気分 (buildFlex に渡す)
+      o.moodResult = { mood, confidence, situation, reason }; // LINE の写真に添える気分 (buildFlex に渡す)
       picks.push(o);
     }
   }
@@ -528,8 +530,7 @@ export function moodCaption(result) {
     return { text: `${m.emoji} ${CAT_NAME}「${m.say}」`, sub: `確からしさ ${Math.round(result.confidence * 100)}%`, color: m.color };
   }
   // 気分がわからないときは、何をしているかを出す。それもわからなければ、わからない理由
-  const act = ACTIVITIES[result.activity];
-  if (act) return { text: `😺 ${CAT_NAME}「${act}」`, sub: "気分は、よくわからないニャ", color: NEUTRAL_COLOR };
+  if (result.situation) return { text: `😺 ${CAT_NAME}「${result.situation}」`, sub: "気分は、よくわからないニャ", color: NEUTRAL_COLOR };
   return { text: `❔ ${CAT_NAME}「${REASONS[result.reason] || UNCLEAR_SAY}」`, sub: null, color: UNCLEAR_COLOR };
 }
 
