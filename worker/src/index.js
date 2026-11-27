@@ -63,8 +63,9 @@ export const MOODS = {
   aggressive: { label: "攻撃的", say: "怒っているニャ！", emoji: "😾", color: "#D64545" },
 };
 const UNCLEAR_SAY = "今の気分は、よくわからないニャ";
-const MOOD_MIN_CONFIDENCE = 0.45; // いちばん高い気分がこれ未満なら、気分は出さない (何をしているか・わからない理由を出す)
-const MOOD_SURE_CONFIDENCE = 0.6; // これ未満なら「たぶん」を付ける
+// 気分を出すのは、いちばん高い気分の確からしさ (%) がこれを超えたときだけ。60%以下なら気分は出さず、
+// 何をしているか・わからない理由を出す。ほぼ同じ写真で気分が食い違ったため (2026-11-27)
+const MOOD_MIN_PERCENT = 60;
 // 気分がわからないときに出す、何をしているか (写真から見て取れること)
 const ACTIVITIES = {
   sleeping: "寝ているニャ",
@@ -224,7 +225,8 @@ export function parseMood(j) {
   if (total <= 0) return { mood: null, confidence: 0 };
   const [mood, top] = probs.reduce((a, b) => (b[1] > a[1] ? b : a));
   const confidence = top / total;
-  return confidence >= MOOD_MIN_CONFIDENCE ? { mood, confidence } : { mood: null, confidence };
+  // 0.6 が 0.5999… になる誤差を避け、% に丸めてから比べる
+  return Math.round(confidence * 100) > MOOD_MIN_PERCENT ? { mood, confidence } : { mood: null, confidence };
 }
 
 // Haiku の写りの採点から { ok: 送ってよいか, quality: 1〜10, mood, confidence } を取り出す。読めなければ null
@@ -523,8 +525,7 @@ export function moodCaption(result) {
   if (!result) return null;
   const m = result.mood && MOODS[result.mood];
   if (m) {
-    const maybe = result.confidence < MOOD_SURE_CONFIDENCE ? "たぶん" : "";
-    return { text: `${m.emoji} ${CAT_NAME}「${maybe}${m.say}」`, sub: `確からしさ ${Math.round(result.confidence * 100)}%`, color: m.color };
+    return { text: `${m.emoji} ${CAT_NAME}「${m.say}」`, sub: `確からしさ ${Math.round(result.confidence * 100)}%`, color: m.color };
   }
   // 気分がわからないときは、何をしているかを出す。それもわからなければ、わからない理由
   const act = ACTIVITIES[result.activity];
