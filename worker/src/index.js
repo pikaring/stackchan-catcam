@@ -231,7 +231,11 @@ async function checkPhoto(env, key, avoidPeople = true) {
 async function ratePhoto(env, key, avoidPeople = true) {
   const object = await env.PHOTOS.get(key);
   if (!object) return null;
-  return parsePhotoRating(await askHaiku(env, await object.arrayBuffer(), PHOTO_RATE_PROMPT), avoidPeople);
+  const text = await askHaiku(env, await object.arrayBuffer(), PHOTO_RATE_PROMPT);
+  const rating = parsePhotoRating(text, avoidPeople);
+  // 読めなかった理由を後で調べられるよう、答えの頭を残す (気分が読めなかったときも)
+  if (rating === null || rating.mood === null) console.log("rate", key, rating === null ? "unreadable" : "mood-null", JSON.stringify(String(text).slice(0, 300)));
+  return rating;
 }
 
 // 画像と質問を Haiku に送り、答えの文字列を返す。キーがない・拒否・エラーなら null
