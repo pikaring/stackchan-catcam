@@ -373,9 +373,12 @@ export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COU
       .slice(0, PHOTO_CHECKS_PER_SLOT);
     let chosen = null;
     for (const o of candidates) {
-      const ok = await check(o.key);
-      if (ok === null) return fallback; // Haiku が答えられないときは物体検出の結果だけで選ぶ
+      const result = await check(o.key);
+      if (result === null) return fallback; // Haiku が答えられないときは物体検出の結果だけで選ぶ
+      // check は true / false か、気分つきの { ok, mood, confidence } を返す
+      const ok = typeof result === "object" ? result.ok : result;
       if (ok) {
+        if (typeof result === "object") o.moodResult = { mood: result.mood, confidence: result.confidence };
         chosen = o;
         break;
       }
@@ -562,7 +565,8 @@ async function sendOwnerReport(env, now = new Date()) {
     objects = objects.concat(listed.objects);
   }
   objects = objects.filter((o) => o.key.slice("photos/".length) >= fromKey);
-  const picks = await pickCheckedPhotos(objects, (key) => checkPhoto(env, key, false), DIGEST_PHOTO_COUNT, false);
+  // 写りの点は使わないが、気分を添えるため、18:05 と同じ採点の質問で確かめる
+  const picks = await pickCheckedPhotos(objects, (key) => ratePhoto(env, key, false), DIGEST_PHOTO_COUNT, false);
   if (picks.length === 0) {
     const last = objects.map((o) => o.key).sort().pop();
     const text = last
@@ -573,7 +577,7 @@ async function sendOwnerReport(env, now = new Date()) {
   }
   const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
   const times = picks.map((o) => `${o.key.slice(18, 20)}:${o.key.slice(20, 22)}`).join(" ");
-  await lineSend(env, buildFlex(dates.at(-1), urls, `${title} ${times}`), env.LINE_OWNER_ID);
+  await lineSend(env, buildFlex(dates.at(-1), urls, `${title} ${times}`, picks.map((o) => o.moodResult)), env.LINE_OWNER_ID);
   return { sent: picks.length, photos: objects.length };
 }
 
