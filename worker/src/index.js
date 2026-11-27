@@ -38,7 +38,7 @@ const PHOTO_CHECKS_PER_SLOT = 3; // 1区間で Haiku に聞く写真の上限 (�
 // 18:05 は区間に分けず、その日いちばんよく撮れた写真を送る (2026-11-11 ユーザー判断)。
 // PHOTO_CHECK_PROMPT の2問に、写りの点 (1〜10) を足して Haiku に聞く
 const PHOTO_RATE_PROMPT =
-  "This is a photo from a pet camera in a room. Answer three questions. " +
+  "This is a photo from a pet camera in a room. Answer six questions. " +
   "1) Is any part of a human visible, such as a person seen from behind, hair, a back, an arm, a hand, a leg, or a foot? " +
   "Ignore pictures of people on posters, boxes, or screens. " +
   "2) Is a real cat clearly visible? Plush toys and pictures of cats do not count. " +
@@ -47,21 +47,45 @@ const PHOTO_RATE_PROMPT =
   "Rate lower when it is blurry, dark, far away, cut off at the edge, or mostly hidden behind cage bars. " +
   "4) Estimate the cat's mood from its face, posture, and movement as probabilities from 0 to 1 that sum to 1: " +
   "relaxed, alert, scared, aggressive. " +
-  "5) Is the photo good enough to judge the mood? Answer false if the light is poor, the cat's face or body is hard to see, " +
-  "it is blurry, far away, cut off, hidden behind bars, or seen from a bad angle. " +
+  "5) What is the cat doing? Choose one of: sleeping, resting, grooming, walking, eating, playing, looking_out, other, unknown. " +
+  "6) If the mood is hard to judge from this photo, why? Choose one of: none, dark, blurry, far, hidden, cut_off, angle " +
+  "(dark = poor light, hidden = behind cage bars or objects, cut_off = cut off at the edge, angle = face or body not visible). " +
   'Reply with only flat JSON: {"person": true or false, "cat": true or false, "quality": <integer>, ' +
-  '"relaxed": <number>, "alert": <number>, "scared": <number>, "aggressive": <number>, "mood_clear": true or false}.';
+  '"relaxed": <number>, "alert": <number>, "scared": <number>, "aggressive": <number>, ' +
+  '"activity": "<one word from question 5>", "reason": "<one word from question 6>"}.';
 // 気分の推定 (MiaoSense の4分類にならう)。写真から Claude Haiku が見た目で推定する目安で、診断ではない
 // say は猫 (モモ) のセリフ
 export const CAT_NAME = "モモ";
 export const MOODS = {
   relaxed: { label: "リラックス", say: "リラックスしているニャ", emoji: "😌", color: "#2E9E5B" },
-  alert: { label: "警戒", say: "ちょっと警戒しているニャ", emoji: "👀", color: "#E0A100" },
+  alert: { label: "警戒", say: "警戒しているニャ", emoji: "👀", color: "#E0A100" },
   scared: { label: "怖がり", say: "怖いニャ…", emoji: "😨", color: "#3B7DD8" },
   aggressive: { label: "攻撃的", say: "怒っているニャ！", emoji: "😾", color: "#D64545" },
 };
 const UNCLEAR_SAY = "今の気分は、よくわからないニャ";
-const MOOD_MIN_CONFIDENCE = 0.5; // いちばん高い気分がこれ未満なら「気分が不明瞭です」にする
+const MOOD_MIN_CONFIDENCE = 0.45; // いちばん高い気分がこれ未満なら、気分は出さない (何をしているか・わからない理由を出す)
+const MOOD_SURE_CONFIDENCE = 0.6; // これ未満なら「たぶん」を付ける
+// 気分がわからないときに出す、何をしているか (写真から見て取れること)
+const ACTIVITIES = {
+  sleeping: "寝ているニャ",
+  resting: "のんびりしているニャ",
+  grooming: "毛づくろい中ニャ",
+  walking: "歩いているニャ",
+  eating: "ごはん中ニャ",
+  playing: "遊んでいるニャ",
+  looking_out: "外を見ているニャ",
+};
+// 何をしているかもわからないときに出す、わからない理由
+const REASONS = {
+  dark: "暗くてよく見えないニャ",
+  blurry: "ぶれちゃったニャ",
+  far: "遠くてよくわからないニャ",
+  hidden: "柵のかげで見えないニャ",
+  cut_off: "はしっこで見えないニャ",
+  angle: "向きが悪くてわからないニャ",
+};
+const NEUTRAL_COLOR = "#6B7280";
+const UNCLEAR_COLOR = "#9AA0A6";
 const RATE_CANDIDATES = 12;          // Haiku に点を付けさせる写真の上限 (猫スコアの高い順)
 const RATE_CANDIDATES_PER_HOUR = 2;  // 探す・寄せるで続けて撮った似た写真ばかりが候補にならないよう、1時間ごとの上限
 const DIGEST_MIN_GAP_MIN = 60;       // 送る写真どうしをこの分数以上離す (似た写真が並ばないように)
@@ -191,10 +215,9 @@ export function parsePhotoCheck(text, avoidPeople = true) {
   }
 }
 
-// 4つの気分の確率から { mood, confidence } を取り出す。条件が悪い・確率が読めない・確信が低いときは mood が null (不明瞭)。
-// 確率は合計が1になるよう直す
+// 4つの気分の確率から { mood, confidence } を取り出す。確率が読めない・確信が低いときは mood が null (不明瞭)。
+// 確率は合計が1になるよう直す。Haiku の「判断できる写りか」の答えでは打ち消さない (不明瞭が多すぎたため、2026-11-27)
 export function parseMood(j) {
-  if (j.mood_clear !== true) return { mood: null, confidence: 0 };
   const probs = Object.keys(MOODS).map((k) => [k, Number(j[k])]);
   if (probs.some(([, v]) => !Number.isFinite(v) || v < 0)) return { mood: null, confidence: 0 };
   const total = probs.reduce((sum, [, v]) => sum + v, 0);
@@ -212,7 +235,7 @@ export function parsePhotoRating(text, avoidPeople = true) {
   const j = JSON.parse(text.match(/\{[^}]*\}/)[0]);
   const quality = Number(j.quality);
   if (!Number.isFinite(quality) || quality < 1 || quality > 10) return null;
-  return { ok, quality, ...parseMood(j) };
+  return { ok, quality, ...parseMood(j), activity: ACTIVITIES[j.activity] ? j.activity : null, reason: REASONS[j.reason] ? j.reason : null };
 }
 
 async function askVision(env, body) {
@@ -319,6 +342,50 @@ async function handleImage(request, env, key) {
   });
 }
 
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+// 写真を押したときに開くページ。LINE の画像は押すと画像ファイルだけが開き、メッセージの文字は付かないため、
+// 写真とモモのセリフを並べて出す。文字は URL の t (セリフ)・s (確からしさなど)・c (色。# なしの16進) で受け取る
+export function viewerHtml(imgSrc, text, sub, color) {
+  const c = /^[0-9A-Fa-f]{6}$/.test(color) ? `#${color}` : UNCLEAR_COLOR;
+  return `<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>${escapeHtml(CAT_NAME)}の写真</title>
+<style>body{margin:0;background:#111;color:#fff;font-family:system-ui,-apple-system,"Hiragino Sans",sans-serif}main{max-width:900px;margin:0 auto}
+img{display:block;width:100%;height:auto}.cap{padding:14px 16px 28px;border-top:6px solid ${c}}.t{font-size:20px;font-weight:700;color:${c}}.s{margin-top:6px;font-size:13px;color:#aaa}</style>
+</head><body><main><img src="${escapeHtml(imgSrc)}" alt="">
+<div class="cap"><div class="t">${escapeHtml(text)}</div>${sub ? `<div class="s">${escapeHtml(sub)}</div>` : ""}</div></main></body></html>`;
+}
+
+async function handleViewer(request, env, key) {
+  const url = new URL(request.url);
+  const exp = url.searchParams.get("exp");
+  const sig = url.searchParams.get("sig");
+  if (!(await verifySig(env, key, exp, sig))) return new Response("forbidden", { status: 403 });
+  const imgSrc = `/img/${key}?exp=${encodeURIComponent(exp)}&sig=${encodeURIComponent(sig)}`;
+  const html = viewerHtml(imgSrc, url.searchParams.get("t") || "", url.searchParams.get("s") || "", url.searchParams.get("c") || "");
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "private, no-store" } });
+}
+
+// LINE の URI は1000文字まで。気分つきの写真を押したときに開くページの URL (長すぎれば null = 写真そのもの)
+async function viewerUrl(env, key, caption) {
+  const exp = Math.floor(Date.now() / 1000) + URL_LIFETIME_SEC;
+  const sig = await sign(env, key, exp);
+  const q = `exp=${exp}&sig=${sig}&t=${encodeURIComponent(caption.text)}&s=${encodeURIComponent(caption.sub || "")}&c=${caption.color.slice(1)}`;
+  const url = `${env.PUBLIC_BASE_URL}/photo/${key}?${q}`;
+  return url.length <= 1000 ? url : null;
+}
+
+// 選んだ写真の、画像の URL・気分・押したときに開くページ
+async function photoLinks(env, picks) {
+  const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
+  const moods = picks.map((o) => o.moodResult);
+  const taps = await Promise.all(picks.map((o) => (o.moodResult ? viewerUrl(env, o.key, moodCaption(o.moodResult)) : null)));
+  return { urls, moods, taps };
+}
+
 export function catScoreOf(object) {
   const score = Number(object.customMetadata?.cat);
   return Number.isFinite(score) ? score : -1;
@@ -385,7 +452,9 @@ export async function pickCheckedPhotos(objects, check, count = DIGEST_PHOTO_COU
       // check は true / false か、気分つきの { ok, mood, confidence } を返す
       const ok = typeof result === "object" ? result.ok : result;
       if (ok) {
-        if (typeof result === "object") o.moodResult = { mood: result.mood, confidence: result.confidence };
+        if (typeof result === "object") {
+          o.moodResult = { mood: result.mood, confidence: result.confidence, activity: result.activity, reason: result.reason };
+        }
         chosen = o;
         break;
       }
@@ -425,10 +494,10 @@ export async function pickBestPhotos(objects, rate, count = DIGEST_PHOTO_COUNT, 
     .filter((c) => c.ok)
     .sort((a, b) => b.quality - a.quality || catScoreOf(b.o) - catScoreOf(a.o));
   const picks = [];
-  for (const { o, mood, confidence } of ranked) {
+  for (const { o, mood, confidence, activity, reason } of ranked) {
     if (picks.length >= count) break;
     if (picks.every((p) => Math.abs(minuteOf(p.key) - minuteOf(o.key)) >= DIGEST_MIN_GAP_MIN)) {
-      o.moodResult = { mood, confidence }; // LINE の写真に添える気分 (buildFlex に渡す)
+      o.moodResult = { mood, confidence, activity, reason }; // LINE の写真に添える気分 (buildFlex に渡す)
       picks.push(o);
     }
   }
@@ -436,7 +505,7 @@ export async function pickBestPhotos(objects, rate, count = DIGEST_PHOTO_COUNT, 
   return picks.length > 0 ? picks : fallback;
 }
 
-function imageBox(url) {
+function imageBox(url, tapUrl = url) {
   return {
     type: "image",
     url,
@@ -444,23 +513,29 @@ function imageBox(url) {
     aspectMode: "cover",
     aspectRatio: "4:3",
     flex: 1,
-    action: { type: "uri", uri: url },
+    action: { type: "uri", uri: tapUrl },
   };
 }
 
-// 気分の表示 (モモのセリフ)。mood が undefined (気分を調べていない) なら null、mood が null なら「よくわからない」
+// 気分の表示 (モモのセリフ)。result が undefined (気分を調べていない) なら null
 // sub は確からしさ (気分がわかったときだけ)
 export function moodCaption(result) {
   if (!result) return null;
   const m = result.mood && MOODS[result.mood];
-  if (!m) return { text: `❔ ${CAT_NAME}「${UNCLEAR_SAY}」`, sub: null, color: "#9AA0A6" };
-  return { text: `${m.emoji} ${CAT_NAME}「${m.say}」`, sub: `確からしさ ${Math.round(result.confidence * 100)}%`, color: m.color };
+  if (m) {
+    const maybe = result.confidence < MOOD_SURE_CONFIDENCE ? "たぶん" : "";
+    return { text: `${m.emoji} ${CAT_NAME}「${maybe}${m.say}」`, sub: `確からしさ ${Math.round(result.confidence * 100)}%`, color: m.color };
+  }
+  // 気分がわからないときは、何をしているかを出す。それもわからなければ、わからない理由
+  const act = ACTIVITIES[result.activity];
+  if (act) return { text: `😺 ${CAT_NAME}「${act}」`, sub: "気分は、よくわからないニャ", color: NEUTRAL_COLOR };
+  return { text: `❔ ${CAT_NAME}「${REASONS[result.reason] || UNCLEAR_SAY}」`, sub: null, color: UNCLEAR_COLOR };
 }
 
 // 気分があれば、写真を気分の色の枠で囲み、下に気分と確からしさを添える
-function photoCell(url, result) {
+function photoCell(url, result, tapUrl = url) {
   const caption = moodCaption(result);
-  if (!caption) return imageBox(url);
+  if (!caption) return imageBox(url, tapUrl);
   return {
     type: "box",
     layout: "vertical",
@@ -471,22 +546,23 @@ function photoCell(url, result) {
     borderWidth: "medium",
     borderColor: caption.color,
     contents: [
-      imageBox(url),
+      imageBox(url, tapUrl),
       { type: "text", text: caption.text, size: "xs", weight: "bold", color: caption.color, align: "center", wrap: true },
       ...(caption.sub ? [{ type: "text", text: caption.sub, size: "xxs", color: "#9AA0A6", align: "center" }] : []),
     ],
   };
 }
 
-// moods は urls と同じ順の { mood, confidence } の配列 (省略すると気分を添えない)
-export function buildFlex(date, urls, title = `今日の猫 ${date}`, moods = []) {
+// moods は urls と同じ順の気分の配列 (省略すると気分を添えない)。
+// taps は写真を押したときに開くページ (省略すると写真そのもの)。気分つきの写真は、モモのセリフつきのページを開く
+export function buildFlex(date, urls, title = `今日の猫 ${date}`, moods = [], taps = []) {
   const rows = [];
   for (let i = 0; i < urls.length; i += 2) {
     rows.push({
       type: "box",
       layout: "horizontal",
       spacing: "sm",
-      contents: urls.slice(i, i + 2).map((url, j) => photoCell(url, moods[i + j])),
+      contents: urls.slice(i, i + 2).map((url, j) => photoCell(url, moods[i + j], taps[i + j] || url)),
     });
   }
   if (moods.some(Boolean)) {
@@ -546,8 +622,8 @@ async function sendDigest(env, to = env.LINE_TO) {
     await lineSend(env, { type: "text", text: `${date} は猫が写った写真がありませんでした。` }, to);
     return { date, sent: 0 };
   }
-  const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
-  await lineSend(env, buildFlex(date, urls, undefined, picks.map((o) => o.moodResult)), to);
+  const { urls, moods, taps } = await photoLinks(env, picks);
+  await lineSend(env, buildFlex(date, urls, undefined, moods, taps), to);
   return { date, sent: picks.length };
 }
 
@@ -565,15 +641,19 @@ export function ownerReportRange(now = new Date()) {
   return { title: "昼の猫", dates: [today.date], fromKey: `${today.date}/060000` };
 }
 
-async function sendOwnerReport(env, now = new Date()) {
+// 試し送りでは、期間を from / to (JST の "2026-11-25/120000" の形) で指定できる。省略すると、時刻に応じた期間
+const RANGE_KEY = /^\d{4}-\d{2}-\d{2}\/\d{6}$/;
+async function sendOwnerReport(env, now = new Date(), range = null) {
   if (!env.LINE_OWNER_ID) return { sent: 0, reason: "LINE_OWNER_ID is not set" };
-  const { title, dates, fromKey } = ownerReportRange(now);
+  const { title, dates, fromKey } = range
+    ? { title: "試し送り", dates: [...new Set([range.from.slice(0, 10), range.to.slice(0, 10)])], fromKey: range.from }
+    : ownerReportRange(now);
   let objects = [];
   for (const date of dates) {
     const listed = await env.PHOTOS.list({ prefix: `photos/${date}/`, include: ["customMetadata"] });
     objects = objects.concat(listed.objects);
   }
-  objects = objects.filter((o) => o.key.slice("photos/".length) >= fromKey);
+  objects = objects.filter((o) => o.key.slice("photos/".length) >= fromKey && (!range || o.key.slice("photos/".length) <= range.to));
   // 写りの点は使わないが、気分を添えるため、18:05 と同じ採点の質問で確かめる
   const picks = await pickCheckedPhotos(objects, (key) => ratePhoto(env, key, false), DIGEST_PHOTO_COUNT, false);
   if (picks.length === 0) {
@@ -584,9 +664,9 @@ async function sendOwnerReport(env, now = new Date()) {
     await lineSend(env, { type: "text", text }, env.LINE_OWNER_ID);
     return { sent: 0, photos: objects.length };
   }
-  const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
+  const { urls, moods, taps } = await photoLinks(env, picks);
   const times = picks.map((o) => `${o.key.slice(18, 20)}:${o.key.slice(20, 22)}`).join(" ");
-  await lineSend(env, buildFlex(dates.at(-1), urls, `${title} ${times}`, picks.map((o) => o.moodResult)), env.LINE_OWNER_ID);
+  await lineSend(env, buildFlex(dates.at(-1), urls, `${title} ${times}`, moods, taps), env.LINE_OWNER_ID);
   return { sent: picks.length, photos: objects.length };
 }
 
@@ -594,6 +674,9 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/upload") return handleUpload(request, env);
+    if (request.method === "GET" && url.pathname.startsWith("/photo/")) {
+      return handleViewer(request, env, decodeURIComponent(url.pathname.slice("/photo/".length)));
+    }
     if (request.method === "GET" && url.pathname.startsWith("/img/")) {
       return handleImage(request, env, decodeURIComponent(url.pathname.slice("/img/".length)));
     }
@@ -604,7 +687,12 @@ export default {
     }
     if (request.method === "POST" && url.pathname === "/owner-report") {
       if (!authorized(request, env)) return new Response("unauthorized", { status: 401 });
-      return Response.json(await sendOwnerReport(env));
+      const from = url.searchParams.get("from");
+      const to = url.searchParams.get("to");
+      if ((from || to) && !(RANGE_KEY.test(from || "") && RANGE_KEY.test(to || "") && from < to)) {
+        return new Response("from and to must be like 2026-11-25/120000, from < to", { status: 400 });
+      }
+      return Response.json(await sendOwnerReport(env, new Date(), from ? { from, to } : null));
     }
     return new Response("not found", { status: 404 });
   },
