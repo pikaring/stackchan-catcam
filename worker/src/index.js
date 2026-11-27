@@ -52,12 +52,15 @@ const PHOTO_RATE_PROMPT =
   'Reply with only flat JSON: {"person": true or false, "cat": true or false, "quality": <integer>, ' +
   '"relaxed": <number>, "alert": <number>, "scared": <number>, "aggressive": <number>, "mood_clear": true or false}.';
 // 気分の推定 (MiaoSense の4分類にならう)。写真から Claude Haiku が見た目で推定する目安で、診断ではない
+// say は猫 (モモ) のセリフ
+export const CAT_NAME = "モモ";
 export const MOODS = {
-  relaxed: { label: "リラックス", emoji: "😌", color: "#2E9E5B" },
-  alert: { label: "警戒", emoji: "👀", color: "#E0A100" },
-  scared: { label: "怖がり", emoji: "😨", color: "#3B7DD8" },
-  aggressive: { label: "攻撃的", emoji: "😾", color: "#D64545" },
+  relaxed: { label: "リラックス", say: "リラックスしているニャ", emoji: "😌", color: "#2E9E5B" },
+  alert: { label: "警戒", say: "ちょっと警戒しているニャ", emoji: "👀", color: "#E0A100" },
+  scared: { label: "怖がり", say: "怖いニャ…", emoji: "😨", color: "#3B7DD8" },
+  aggressive: { label: "攻撃的", say: "怒っているニャ！", emoji: "😾", color: "#D64545" },
 };
+const UNCLEAR_SAY = "今の気分は、よくわからないニャ";
 const MOOD_MIN_CONFIDENCE = 0.5; // いちばん高い気分がこれ未満なら「気分が不明瞭です」にする
 const RATE_CANDIDATES = 12;          // Haiku に点を付けさせる写真の上限 (猫スコアの高い順)
 const RATE_CANDIDATES_PER_HOUR = 2;  // 探す・寄せるで続けて撮った似た写真ばかりが候補にならないよう、1時間ごとの上限
@@ -441,12 +444,13 @@ function imageBox(url) {
   };
 }
 
-// 気分の表示。mood が undefined (気分を調べていない) なら null、mood が null なら「気分が不明瞭です」
+// 気分の表示 (モモのセリフ)。mood が undefined (気分を調べていない) なら null、mood が null なら「よくわからない」
+// sub は確からしさ (気分がわかったときだけ)
 export function moodCaption(result) {
   if (!result) return null;
   const m = result.mood && MOODS[result.mood];
-  if (!m) return { text: "❔ 気分が不明瞭です", color: "#9AA0A6" };
-  return { text: `${m.emoji} ${m.label} ${Math.round(result.confidence * 100)}%`, color: m.color };
+  if (!m) return { text: `❔ ${CAT_NAME}「${UNCLEAR_SAY}」`, sub: null, color: "#9AA0A6" };
+  return { text: `${m.emoji} ${CAT_NAME}「${m.say}」`, sub: `確からしさ ${Math.round(result.confidence * 100)}%`, color: m.color };
 }
 
 // 気分があれば、写真を気分の色の枠で囲み、下に気分と確からしさを添える
@@ -465,6 +469,7 @@ function photoCell(url, result) {
     contents: [
       imageBox(url),
       { type: "text", text: caption.text, size: "xs", weight: "bold", color: caption.color, align: "center", wrap: true },
+      ...(caption.sub ? [{ type: "text", text: caption.sub, size: "xxs", color: "#9AA0A6", align: "center" }] : []),
     ],
   };
 }
@@ -481,7 +486,7 @@ export function buildFlex(date, urls, title = `今日の猫 ${date}`, moods = []
     });
   }
   if (moods.some(Boolean)) {
-    rows.push({ type: "text", text: "気分は写真から AI が見た目で推定した目安です", size: "xxs", color: "#9AA0A6", wrap: true });
+    rows.push({ type: "text", text: `${CAT_NAME}の気分は、写真から AI が見た目で推定した目安です`, size: "xxs", color: "#9AA0A6", wrap: true });
   }
   return {
     type: "flex",
