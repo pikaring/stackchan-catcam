@@ -45,7 +45,20 @@ const PHOTO_RATE_PROMPT =
   "3) How good is this as a photo of the cat, as an integer from 1 (poor) to 10 (excellent)? " +
   "Rate higher when the cat is large in the frame, its face and eyes are visible, it is sharp, and it is well lit. " +
   "Rate lower when it is blurry, dark, far away, cut off at the edge, or mostly hidden behind cage bars. " +
-  'Reply with only JSON: {"person": true or false, "cat": true or false, "quality": <integer>}.';
+  "4) Estimate the cat's mood from its face, posture, and movement as probabilities from 0 to 1 that sum to 1: " +
+  "relaxed, alert, scared, aggressive. " +
+  "5) Is the photo good enough to judge the mood? Answer false if the light is poor, the cat's face or body is hard to see, " +
+  "it is blurry, far away, cut off, hidden behind bars, or seen from a bad angle. " +
+  'Reply with only flat JSON: {"person": true or false, "cat": true or false, "quality": <integer>, ' +
+  '"relaxed": <number>, "alert": <number>, "scared": <number>, "aggressive": <number>, "mood_clear": true or false}.';
+// 気分の推定 (MiaoSense の4分類にならう)。写真から Claude Haiku が見た目で推定する目安で、診断ではない
+export const MOODS = {
+  relaxed: { label: "リラックス", emoji: "😌", color: "#2E9E5B" },
+  alert: { label: "警戒", emoji: "👀", color: "#E0A100" },
+  scared: { label: "怖がり", emoji: "😨", color: "#3B7DD8" },
+  aggressive: { label: "攻撃的", emoji: "😾", color: "#D64545" },
+};
+const MOOD_MIN_CONFIDENCE = 0.5; // いちばん高い気分がこれ未満なら「気分が不明瞭です」にする
 const RATE_CANDIDATES = 12;          // Haiku に点を付けさせる写真の上限 (猫スコアの高い順)
 const RATE_CANDIDATES_PER_HOUR = 2;  // 探す・寄せるで続けて撮った似た写真ばかりが候補にならないよう、1時間ごとの上限
 const DIGEST_MIN_GAP_MIN = 60;       // 送る写真どうしをこの分数以上離す (似た写真が並ばないように)
@@ -175,13 +188,28 @@ export function parsePhotoCheck(text, avoidPeople = true) {
   }
 }
 
-// Haiku の写りの採点から { ok: 送ってよいか, quality: 1〜10 } を取り出す。読めなければ null
+// 4つの気分の確率から { mood, confidence } を取り出す。条件が悪い・確率が読めない・確信が低いときは mood が null (不明瞭)。
+// 確率は合計が1になるよう直す
+export function parseMood(j) {
+  if (j.mood_clear !== true) return { mood: null, confidence: 0 };
+  const probs = Object.keys(MOODS).map((k) => [k, Number(j[k])]);
+  if (probs.some(([, v]) => !Number.isFinite(v) || v < 0)) return { mood: null, confidence: 0 };
+  const total = probs.reduce((sum, [, v]) => sum + v, 0);
+  if (total <= 0) return { mood: null, confidence: 0 };
+  const [mood, top] = probs.reduce((a, b) => (b[1] > a[1] ? b : a));
+  const confidence = top / total;
+  return confidence >= MOOD_MIN_CONFIDENCE ? { mood, confidence } : { mood: null, confidence };
+}
+
+// Haiku の写りの採点から { ok: 送ってよいか, quality: 1〜10, mood, confidence } を取り出す。読めなければ null
+// 気分だけ読めなくても写真選びは止めない (mood は null = 不明瞭)
 export function parsePhotoRating(text, avoidPeople = true) {
   const ok = parsePhotoCheck(text, avoidPeople);
   if (ok === null) return null;
-  const quality = Number(JSON.parse(text.match(/\{[^}]*\}/)[0]).quality);
+  const j = JSON.parse(text.match(/\{[^}]*\}/)[0]);
+  const quality = Number(j.quality);
   if (!Number.isFinite(quality) || quality < 1 || quality > 10) return null;
-  return { ok, quality };
+  return { ok, quality, ...parseMood(j) };
 }
 
 async function askVision(env, body) {
@@ -387,9 +415,12 @@ export async function pickBestPhotos(objects, rate, count = DIGEST_PHOTO_COUNT, 
     .filter((c) => c.ok)
     .sort((a, b) => b.quality - a.quality || catScoreOf(b.o) - catScoreOf(a.o));
   const picks = [];
-  for (const { o } of ranked) {
+  for (const { o, mood, confidence } of ranked) {
     if (picks.length >= count) break;
-    if (picks.every((p) => Math.abs(minuteOf(p.key) - minuteOf(o.key)) >= DIGEST_MIN_GAP_MIN)) picks.push(o);
+    if (picks.every((p) => Math.abs(minuteOf(p.key) - minuteOf(o.key)) >= DIGEST_MIN_GAP_MIN)) {
+      o.moodResult = { mood, confidence }; // LINE の写真に添える気分 (buildFlex に渡す)
+      picks.push(o);
+    }
   }
   picks.sort((a, b) => (a.key < b.key ? -1 : 1));
   return picks.length > 0 ? picks : fallback;
@@ -407,15 +438,47 @@ function imageBox(url) {
   };
 }
 
-export function buildFlex(date, urls, title = `今日の猫 ${date}`) {
+// 気分の表示。mood が undefined (気分を調べていない) なら null、mood が null なら「気分が不明瞭です」
+export function moodCaption(result) {
+  if (!result) return null;
+  const m = result.mood && MOODS[result.mood];
+  if (!m) return { text: "❔ 気分が不明瞭です", color: "#9AA0A6" };
+  return { text: `${m.emoji} ${m.label} ${Math.round(result.confidence * 100)}%`, color: m.color };
+}
+
+// 気分があれば、写真を気分の色の枠で囲み、下に気分と確からしさを添える
+function photoCell(url, result) {
+  const caption = moodCaption(result);
+  if (!caption) return imageBox(url);
+  return {
+    type: "box",
+    layout: "vertical",
+    flex: 1,
+    spacing: "xs",
+    paddingAll: "xs",
+    cornerRadius: "md",
+    borderWidth: "medium",
+    borderColor: caption.color,
+    contents: [
+      imageBox(url),
+      { type: "text", text: caption.text, size: "xs", weight: "bold", color: caption.color, align: "center", wrap: true },
+    ],
+  };
+}
+
+// moods は urls と同じ順の { mood, confidence } の配列 (省略すると気分を添えない)
+export function buildFlex(date, urls, title = `今日の猫 ${date}`, moods = []) {
   const rows = [];
   for (let i = 0; i < urls.length; i += 2) {
     rows.push({
       type: "box",
       layout: "horizontal",
       spacing: "sm",
-      contents: urls.slice(i, i + 2).map(imageBox),
+      contents: urls.slice(i, i + 2).map((url, j) => photoCell(url, moods[i + j])),
     });
+  }
+  if (moods.some(Boolean)) {
+    rows.push({ type: "text", text: "気分は写真から AI が見た目で推定した目安です", size: "xxs", color: "#9AA0A6", wrap: true });
   }
   return {
     type: "flex",
@@ -472,7 +535,7 @@ async function sendDigest(env, to = env.LINE_TO) {
     return { date, sent: 0 };
   }
   const urls = await Promise.all(picks.map((o) => signedUrl(env, o.key)));
-  await lineSend(env, buildFlex(date, urls), to);
+  await lineSend(env, buildFlex(date, urls, undefined, picks.map((o) => o.moodResult)), to);
   return { date, sent: picks.length };
 }
 
